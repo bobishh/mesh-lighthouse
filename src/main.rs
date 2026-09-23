@@ -123,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         NativeNode::start_with_options(NativeNodeOptions {
             secret: Some(secret),
             allowed_peers: vec![owner_id],
+            accept_unlisted_browser_rpc: true,
             ..NativeNodeOptions::default()
         })
         .await?,
