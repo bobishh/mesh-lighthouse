@@ -1,18 +1,21 @@
-use std::{fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration,
+};
 
 use iroh::{EndpointAddr, EndpointId};
-use match_lighthouse::{MatchLighthouseHost, MatchLighthouseState, MatchScopeStore, now_ms};
+use match_lighthouse::{now_ms, MatchLighthouseHost, MatchLighthouseState, MatchScopeStore};
 use meta_mesh_core::{
-    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, VerifyWorkspaceMemberOptions, WorkspaceRole,
-    sign_json_envelope, verify_workspace_member_bundle,
+    sign_json_envelope, verify_workspace_member_bundle, MeshHandshake,
+    VerifyWorkspaceMemberOptions, WorkspaceRole, DEFAULT_SIGNATURE_DOMAIN,
 };
 use meta_mesh_native::{
-    FileScopeStore, NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeService,
-    publish_scope_to, serve_scope_connection, serve_scope_request,
+    publish_scope_to, serve_scope_connection, serve_scope_request, FileScopeStore,
+    NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeService,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use time::{OffsetDateTime, macros::format_description};
+use time::{macros::format_description, OffsetDateTime};
 use tokio::sync::Mutex;
 
 mod http;
@@ -180,9 +183,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let owner = EndpointAddr::new(owner_id);
     let mut browser: Option<Arc<NativeBrowserConnection>> = None;
     let mut receiver: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+    let mut authorized_routes = HashSet::<String>::new();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
+        let signed_routes = service
+            .lock()
+            .await
+            .host_mut()
+            .store
+            .authorized_peer_endpoints()?;
+        let next_routes = signed_routes
+            .into_iter()
+            .filter(|route| {
+                route != &owner_id.to_string() && route != &node.endpoint_id().to_string()
+            })
+            .filter_map(|route| EndpointId::from_str(&route).ok().map(|id| (route, id)))
+            .collect::<Vec<_>>();
+        let next_set = next_routes
+            .iter()
+            .map(|(route, _)| route.clone())
+            .collect::<HashSet<_>>();
+        for (route, id) in &next_routes {
+            if !authorized_routes.contains(route) {
+                node.authorize_peer(*id);
+            }
+        }
+        for route in authorized_routes.difference(&next_set) {
+            if let Ok(id) = EndpointId::from_str(route) {
+                node.revoke_peer(&id);
+            }
+        }
+        authorized_routes = next_set;
         if receiver.as_ref().is_some_and(|task| task.is_finished()) {
             if let Some(task) = receiver.take() {
                 if let Ok(Err(error)) = task.await {

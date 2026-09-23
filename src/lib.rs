@@ -6,21 +6,22 @@ use std::{
 };
 
 use automerge::{
-    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc,
     transaction::{CommitOptions, Transactable},
+    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ReadDoc, ROOT,
 };
 use match_authority::{admit_match_candidate, prepare_match_write_authority};
 use meta_mesh_core::{
-    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
-    WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot, sign_json_envelope,
-    validate_mesh_catalog, verify_workspace_member_bundle,
+    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
+    verify_workspace_member_bundle, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
+    WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot,
+    DEFAULT_SIGNATURE_DOMAIN,
 };
 use meta_mesh_native::{
     FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
     NativeScopeSnapshot,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +30,8 @@ pub struct MatchLighthouseState {
     pub authorization: Value,
     #[serde(default = "empty_chat")]
     pub chat: Value,
+    #[serde(default)]
+    pub mesh: Option<Value>,
 }
 
 fn empty_chat() -> Value {
@@ -101,6 +104,23 @@ impl MatchScopeStore {
             .map_err(|_| "Lighthouse state lock poisoned")?;
         self.authority_for(&guard.state)
             .map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn authorized_peer_endpoints(&self) -> Result<Vec<String>, String> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?;
+        let mesh = verified_mesh_for(self, &guard.state)?;
+        Ok(mesh
+            .get("peers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|peer| peer.pointer("/advertisement/payload/endpoint"))
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Author one Match lead with the lighthouse's own editor credential.
@@ -293,6 +313,22 @@ fn put_text(
         .map_err(|error| error.to_string())
 }
 
+fn verified_mesh_for(
+    store: &MatchScopeStore,
+    state: &MatchLighthouseState,
+) -> Result<Value, String> {
+    let (authority, _) = store.authority_for(state)?;
+    let existing = state
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.get("peers"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let peers = merge_verified_peer_catalog(existing, &[], &authority, now_ms()?)?;
+    Ok(json!({"version": 1, "peers": peers, "revocations": []}))
+}
+
 impl NativeScopeHost for MatchScopeStore {
     fn snapshot(&mut self) -> Result<NativeScopeSnapshot, String> {
         let guard = self
@@ -303,7 +339,7 @@ impl NativeScopeHost for MatchScopeStore {
             document: guard.state.document.clone(),
             authorization: Some(guard.state.authorization.clone()),
             chat: Some(guard.state.chat.clone()),
-            mesh: None,
+            mesh: Some(verified_mesh_for(self, &guard.state)?),
         })
     }
 
@@ -425,9 +461,23 @@ impl NativeScopeHost for MatchScopeStore {
         {
             return Err("Lighthouse cannot apply mesh authority changes yet".into());
         }
-        // Peer advertisements are hints. The signed handshake admits the connected peer;
-        // this storage node does not dial or authorize peers from a received catalog.
-        Ok(())
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?;
+        let (authority, _) = self.authority_for(&guard.state)?;
+        let existing = guard
+            .state
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.get("peers"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let peers = merge_verified_peer_catalog(existing, &catalog.peers, &authority, now_ms()?)?;
+        let mut next = guard.state.clone();
+        next.mesh = Some(json!({"version": 1, "peers": peers, "revocations": []}));
+        self.save(&mut guard, next)
     }
 
     fn merge_durable_batch(&mut self, _: &[u8]) -> Result<(), String> {
@@ -585,11 +635,11 @@ pub fn now_ms() -> Result<i128, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use automerge::{ROOT, transaction::Transactable};
+    use automerge::{transaction::Transactable, ROOT};
     use meta_mesh_core::{
-        DEFAULT_SIGNATURE_DOMAIN, DeviceCertificatePayload, WorkspaceAuthority,
-        WorkspaceChangeAuthorizationPayload, public_key_from_seed, public_key_id,
-        sign_device_certificate, sign_json_envelope,
+        public_key_from_seed, public_key_id, sign_device_certificate, sign_json_envelope,
+        DeviceCertificatePayload, WorkspaceAuthority, WorkspaceChangeAuthorizationPayload,
+        DEFAULT_SIGNATURE_DOMAIN,
     };
 
     #[test]
@@ -662,6 +712,7 @@ mod tests {
             document: baseline.clone(),
             authorization: proof_for(initial_hashes),
             chat: empty_chat(),
+            mesh: None,
         };
         let path = std::env::temp_dir().join(format!(
             "match-lighthouse-{}-{}.json",
@@ -678,17 +729,15 @@ mod tests {
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
         let new_hash = document.get_heads()[0].to_string();
-        assert!(
-            store
-                .persist_document(
-                    &candidate,
-                    Some(&json!({
-                        "version": 1, "records": [], "authority": evidence,
-                    })),
-                    &[new_hash.clone()]
-                )
-                .is_err()
-        );
+        assert!(store
+            .persist_document(
+                &candidate,
+                Some(&json!({
+                    "version": 1, "records": [], "authority": evidence,
+                })),
+                &[new_hash.clone()]
+            )
+            .is_err());
         assert_eq!(store.snapshot().unwrap().document, baseline);
         store
             .persist_document(
@@ -697,15 +746,40 @@ mod tests {
                 &[document.get_heads()[0].to_string()],
             )
             .unwrap();
-        assert!(
-            store
-                .persist_document(&baseline, Some(&initial.authorization), &[])
-                .is_err()
-        );
+        assert!(store
+            .persist_document(&baseline, Some(&initial.authorization), &[])
+            .is_err());
         assert_eq!(store.snapshot().unwrap().document, candidate);
+        let issued_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let advertisement = sign_json_envelope(
+            &[2; 32],
+            json!({"kind":"peer-advertisement","version":1,"workspaceId":"board",
+                "personId":person_id,"deviceId":device_id,"instanceId":"test",
+                "endpoint":"signed-route","issuedAt":issued_at,"routeSequence":1}),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let peer = json!({"advertisement":advertisement,"publicKey":public_key,
+            "certificates":[certificate]});
+        store.merge_mesh(&json!({"version":1,"peers":[peer, {"advertisement":{"payload":{"endpoint":"fake"}}}],
+            "revocations":[]})).unwrap();
+        assert_eq!(
+            store.authorized_peer_endpoints().unwrap(),
+            vec!["signed-route"]
+        );
+        assert!(store
+            .merge_mesh(&json!({"version":1,"peers":[],"revocations":[{}]}))
+            .is_err());
         let mut reopened =
             MatchScopeStore::open("board".into(), person_id, path.clone(), initial).unwrap();
         assert_eq!(reopened.snapshot().unwrap().document, candidate);
+        assert_eq!(
+            reopened.authorized_peer_endpoints().unwrap(),
+            vec!["signed-route"]
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

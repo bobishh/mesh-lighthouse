@@ -1,19 +1,19 @@
 use std::{fs, io::Write, path::PathBuf, str::FromStr, time::Duration};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use iroh::{EndpointAddr, EndpointId};
-use match_lighthouse::{MatchLighthouseState, MatchScopeStore, now_ms};
+use match_lighthouse::{now_ms, MatchLighthouseState, MatchScopeStore};
 use meta_mesh_core::{
-    DEFAULT_SIGNATURE_DOMAIN, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
+    decode_workspace_set, parse_invitation, public_key_from_seed, public_key_id,
+    sign_device_certificate, sign_json_envelope, verify_workspace_grant,
+    verify_workspace_member_bundle, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
     PublicIdentity, ScopedInvitation, VerifyWorkspaceMemberOptions, WorkspaceGrant,
-    WorkspaceJoinHandshake, WorkspaceJoinResponse, WorkspaceRole, decode_workspace_set,
-    parse_invitation, public_key_from_seed, public_key_id, sign_device_certificate,
-    sign_json_envelope, verify_workspace_grant, verify_workspace_member_bundle,
+    WorkspaceJoinHandshake, WorkspaceJoinResponse, WorkspaceRole, DEFAULT_SIGNATURE_DOMAIN,
 };
-use meta_mesh_native::{NativeNode, NativeNodeOptions};
+use meta_mesh_native::{NativeNode, NativeNodeOptions, NativeScopeHost};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use time::{OffsetDateTime, macros::format_description};
+use serde_json::{json, Value};
+use time::{macros::format_description, OffsetDateTime};
 
 use crate::Config;
 
@@ -253,7 +253,7 @@ fn prepare_config(
     let workspace_set = URL_SAFE_NO_PAD.decode(received.snapshot)?;
     let entries = decode_workspace_set(&workspace_set, &[invite.workspace_id.clone()])?;
     let entry = &entries[0];
-    let state = MatchLighthouseState {
+    let mut state = MatchLighthouseState {
         document: URL_SAFE_NO_PAD.decode(&entry.bytes)?,
         authorization: entry
             .authorization
@@ -263,6 +263,7 @@ fn prepare_config(
             .chat
             .clone()
             .unwrap_or_else(|| json!({"version":1,"messages":[],"profiles":[],"typing":[]})),
+        mesh: None,
     };
     let mut local_peer = bundle.clone();
     local_peer["grant"] = serde_json::to_value(grant)?;
@@ -282,7 +283,7 @@ fn prepare_config(
     if verified_local.role != role {
         return Err("Lighthouse grant and advertisement disagree".into());
     }
-    let store = MatchScopeStore::open(
+    let mut store = MatchScopeStore::open(
         invite.workspace_id.clone(),
         invite.issuer_person_id.clone(),
         directory.join("state.json"),
@@ -294,6 +295,10 @@ fn prepare_config(
     {
         return Err("Match document owner differs from invitation issuer".into());
     }
+    let mut initial_peers = peers.clone();
+    initial_peers.push(local_peer.clone());
+    store.merge_mesh(&json!({"version": 1, "peers": initial_peers, "revocations": []}))?;
+    state.mesh = store.snapshot()?.mesh;
     let handshake = MeshHandshake {
         workspace_id: invite.workspace_id.clone(),
         peer: local_peer,
