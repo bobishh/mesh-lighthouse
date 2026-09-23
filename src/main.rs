@@ -1,21 +1,26 @@
 use std::{
-    collections::HashSet, fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::{HashMap, HashSet},
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
 use iroh::{EndpointAddr, EndpointId};
-use match_lighthouse::{now_ms, MatchLighthouseHost, MatchLighthouseState, MatchScopeStore};
+use match_lighthouse::{MatchLighthouseHost, MatchLighthouseState, MatchScopeStore, now_ms};
 use meta_mesh_core::{
-    sign_json_envelope, verify_workspace_member_bundle, MeshHandshake,
-    VerifyWorkspaceMemberOptions, WorkspaceRole, DEFAULT_SIGNATURE_DOMAIN,
+    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshRuntimeState, VerifyWorkspaceMemberOptions,
+    sign_json_envelope, verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
-    publish_scope_to, serve_scope_connection, serve_scope_request, FileScopeStore,
-    NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeService,
+    FileScopeStore, NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeService,
+    publish_scope_to, serve_scope_connection, serve_scope_request,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use time::{macros::format_description, OffsetDateTime};
+use time::{OffsetDateTime, macros::format_description};
 use tokio::sync::Mutex;
 
 mod http;
@@ -181,26 +186,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         node.endpoint_id(),
         config.workspace_id
     );
-    let owner = EndpointAddr::new(owner_id);
-    let mut browser: Option<Arc<NativeBrowserConnection>> = None;
-    let mut receiver: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+    let mut peers = HashMap::<
+        String,
+        (
+            Arc<NativeBrowserConnection>,
+            tokio::task::JoinHandle<Result<(), String>>,
+        ),
+    >::new();
+    let mut reconnects = MeshRuntimeState::default();
+    reconnects.start();
     let mut authorized_routes = HashSet::<String>::new();
+    let previous = route_store
+        .read()?
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| "Invalid lighthouse route sequence".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "Invalid lighthouse route sequence".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let route_sequence = previous.saturating_add(1).max(now_ms()?.try_into()?);
+    route_store.write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
+    refresh_route(
+        &mut service.lock().await.host_mut().local_handshake,
+        &device_seed,
+        route_sequence,
+    )?;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
+        let tick_ms: u64 = now_ms()?.try_into()?;
         let signed_routes = service
             .lock()
             .await
             .host_mut()
             .store
             .authorized_peer_endpoints()?;
-        let next_routes = signed_routes
+        let mut next_routes = signed_routes
             .into_iter()
             .filter(|route| {
                 route != &owner_id.to_string() && route != &node.endpoint_id().to_string()
             })
             .filter_map(|route| EndpointId::from_str(&route).ok().map(|id| (route, id)))
             .collect::<Vec<_>>();
+        next_routes.sort_by(|left, right| left.0.cmp(&right.0));
+        next_routes.dedup_by(|left, right| left.0 == right.0);
+        next_routes.push((owner_id.to_string(), owner_id));
         let next_set = next_routes
             .iter()
             .map(|(route, _)| route.clone())
@@ -214,116 +247,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Ok(id) = EndpointId::from_str(route) {
                 node.revoke_peer(&id);
             }
+            if let Some((connection, receiver)) = peers.remove(route) {
+                connection.close();
+                receiver.abort();
+                service
+                    .lock()
+                    .await
+                    .forget_peer(&config.workspace_id, route);
+            }
+            reconnects.clear_reconnect(route);
         }
         authorized_routes = next_set;
-        if receiver.as_ref().is_some_and(|task| task.is_finished()) {
-            if let Some(task) = receiver.take() {
+        let finished = peers
+            .iter()
+            .filter(|(_, (_, task))| task.is_finished())
+            .map(|(route, _)| route.clone())
+            .collect::<Vec<_>>();
+        for route in finished {
+            if let Some((connection, task)) = peers.remove(&route) {
                 if let Ok(Err(error)) = task.await {
-                    eprintln!("Lighthouse receive: {error}");
+                    eprintln!("Lighthouse receive from {route}: {error}");
                 }
-            }
-            if let Some(connection) = browser.take() {
                 connection.close();
             }
             service
                 .lock()
                 .await
-                .forget_peer(&config.workspace_id, &owner_id.to_string());
+                .forget_peer(&config.workspace_id, &route);
+            reconnects.schedule_reconnect(route, now_ms()?.try_into()?, 10_000, 60_000);
         }
-        if browser.is_none() {
-            let previous = route_store
-                .read()?
-                .map(|bytes| {
-                    String::from_utf8(bytes)
-                        .map_err(|_| "Invalid lighthouse route sequence".to_string())?
-                        .parse::<u64>()
-                        .map_err(|_| "Invalid lighthouse route sequence".to_string())
-                })
-                .transpose()?
-                .unwrap_or(0);
-            let route_sequence = previous.saturating_add(1).max(now_ms()?.try_into()?);
-            route_store
-                .write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
-            refresh_route(
-                &mut service.lock().await.host_mut().local_handshake,
-                &device_seed,
-                route_sequence,
-            )?;
-            let connection = match node
-                .connect_browser(owner.clone(), Duration::from_secs(12))
-                .await
-            {
-                Ok(connection) => Arc::new(connection),
-                Err(error) => {
-                    eprintln!("Lighthouse connect: {error}");
+        for (route, id) in &next_routes {
+            if !peers.contains_key(route) {
+                if reconnects
+                    .reconnect_state(route)
+                    .is_some_and(|state| state.retry_at_ms > tick_ms)
+                {
                     continue;
                 }
-            };
-            let request = service
-                .lock()
-                .await
-                .prepare_connect(&config.workspace_id, &config.transport_secret)?;
-            match connection.exchange(&request, Duration::from_secs(12)).await {
-                Ok(response) => {
-                    let peer = service.lock().await.complete_connect(
-                        &config.workspace_id,
-                        &config.transport_secret,
-                        &owner_id.to_string(),
-                        &response,
-                        now_ms()?,
-                    );
-                    match peer {
-                        Ok(peer) if peer.role == WorkspaceRole::Owner => {
-                            let incoming_connection = Arc::clone(&connection);
-                            let incoming_service = Arc::clone(&service);
-                            let remote_id = owner_id.to_string();
-                            receiver = Some(tokio::spawn(async move {
-                                serve_scope_connection(
-                                    &incoming_connection,
-                                    &incoming_service,
-                                    &remote_id,
-                                    || now_ms().map_err(|error| error.to_string()),
-                                )
-                                .await
-                            }));
-                            browser = Some(connection);
-                        }
-                        Ok(_) => {
-                            return Err(
-                                "Configured lighthouse peer is not the workspace owner".into()
-                            );
-                        }
-                        Err(error) => eprintln!("Lighthouse handshake: {error}"),
+                let connection = match node
+                    .connect_browser(EndpointAddr::new(*id), Duration::from_secs(12))
+                    .await
+                {
+                    Ok(connection) => Arc::new(connection),
+                    Err(error) => {
+                        eprintln!("Lighthouse connect to {route}: {error}");
+                        reconnects.schedule_reconnect(
+                            route.clone(),
+                            now_ms()?.try_into()?,
+                            10_000,
+                            60_000,
+                        );
+                        continue;
                     }
-                }
-                Err(error) => eprintln!("Lighthouse connect: {error}"),
-            }
-            continue;
-        }
-        let connection = browser.as_ref().expect("connected above");
-        match publish_scope_to(
-            connection,
-            &service,
-            &config.workspace_id,
-            &owner_id.to_string(),
-            now_ms()?,
-            Duration::from_secs(12),
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(error) if error == "Unauthenticated mesh peer" => {}
-            Err(error) => {
-                eprintln!("Lighthouse publish: {error}");
-                connection.close();
-                browser = None;
-                if let Some(task) = receiver.take() {
-                    task.abort();
-                }
-                service
+                };
+                let request = service
                     .lock()
                     .await
-                    .forget_peer(&config.workspace_id, &owner_id.to_string());
+                    .prepare_connect(&config.workspace_id, &config.transport_secret)?;
+                match connection.exchange(&request, Duration::from_secs(12)).await {
+                    Ok(response) => {
+                        let peer = service.lock().await.complete_connect(
+                            &config.workspace_id,
+                            &config.transport_secret,
+                            route,
+                            &response,
+                            now_ms()?,
+                        );
+                        match peer {
+                            Ok(_) => {
+                                reconnects.clear_reconnect(route);
+                                let incoming_connection = Arc::clone(&connection);
+                                let incoming_service = Arc::clone(&service);
+                                let remote_id = route.clone();
+                                let receiver = tokio::spawn(async move {
+                                    serve_scope_connection(
+                                        &incoming_connection,
+                                        &incoming_service,
+                                        &remote_id,
+                                        || now_ms().map_err(|error| error.to_string()),
+                                    )
+                                    .await
+                                });
+                                peers.insert(route.clone(), (connection, receiver));
+                            }
+                            Err(error) => {
+                                eprintln!("Lighthouse handshake with {route}: {error}");
+                                connection.close();
+                                reconnects.schedule_reconnect(
+                                    route.clone(),
+                                    now_ms()?.try_into()?,
+                                    10_000,
+                                    60_000,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Lighthouse connect to {route}: {error}");
+                        connection.close();
+                        reconnects.schedule_reconnect(
+                            route.clone(),
+                            now_ms()?.try_into()?,
+                            10_000,
+                            60_000,
+                        );
+                    }
+                }
+            }
+            let Some((connection, _)) = peers.get(route) else {
+                continue;
+            };
+            match publish_scope_to(
+                connection,
+                &service,
+                &config.workspace_id,
+                route,
+                now_ms()?,
+                Duration::from_secs(12),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) if error == "Unauthenticated mesh peer" => {}
+                Err(error) => {
+                    eprintln!("Lighthouse publish to {route}: {error}");
+                    if let Some((connection, task)) = peers.remove(route) {
+                        connection.close();
+                        task.abort();
+                    }
+                    service
+                        .lock()
+                        .await
+                        .forget_peer(&config.workspace_id, route);
+                    reconnects.schedule_reconnect(
+                        route.clone(),
+                        now_ms()?.try_into()?,
+                        10_000,
+                        60_000,
+                    );
+                }
             }
         }
     }
