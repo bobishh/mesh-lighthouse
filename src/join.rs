@@ -35,8 +35,11 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
     if invite.workspaces.len() != 1 {
         return Err("Lighthouse accepts one workspace per invitation".into());
     }
-    if directory.exists() {
-        return Err("Lighthouse state directory already exists".into());
+    let directory_existed = directory.exists();
+    if directory_existed
+        && (directory.join("config.json").exists() || directory.join("state.json").exists())
+    {
+        return Err("Lighthouse identity already exists in state directory".into());
     }
 
     let identity_seed: [u8; 32] = rand::random();
@@ -120,7 +123,7 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
     session.close();
     node.close().await?;
     if result.is_err() && !directory.join("config.json").exists() {
-        let _ = fs::remove_dir_all(&directory);
+        cleanup_failed_join(&directory, directory_existed);
     }
     let config = result?;
     println!(
@@ -341,11 +344,47 @@ fn save_config(directory: &PathBuf, config: &Config) -> Result<(), BoxError> {
 }
 
 fn create_private_directory(directory: &PathBuf) -> Result<(), BoxError> {
-    fs::create_dir(directory)?;
+    match fs::create_dir(directory) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(directory)?.file_type().is_dir() {
+                return Err("Lighthouse state path is not a directory".into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+fn cleanup_failed_join(directory: &PathBuf, directory_existed: bool) {
+    let _ = fs::remove_file(directory.join("state.json"));
+    if !directory_existed {
+        let _ = fs::remove_dir(directory);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_join_preserves_existing_http_inbox() {
+        let directory =
+            std::env::temp_dir().join(format!("lighthouse-join-{}", rand::random::<u128>()));
+        fs::create_dir(&directory).unwrap();
+        let inbox = directory.join("inbox");
+        fs::create_dir(&inbox).unwrap();
+        fs::write(inbox.join("pending.json"), b"pending").unwrap();
+        create_private_directory(&directory).unwrap();
+        fs::write(directory.join("state.json"), b"incomplete").unwrap();
+        cleanup_failed_join(&directory, true);
+        assert!(!directory.join("state.json").exists());
+        assert_eq!(fs::read(inbox.join("pending.json")).unwrap(), b"pending");
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
