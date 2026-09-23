@@ -1,0 +1,29 @@
+[package]
+name = "mesh-lighthouse"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "match_lighthouse"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mesh-lighthouse"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+match-authority = { path = "vendor/match/crates/match-authority" }
+meta-mesh-core = { path = "vendor/match/vendor/meta-mesh/crates/meta-mesh-core" }
+meta-mesh-native = { path = "vendor/match/vendor/meta-mesh/crates/meta-mesh-native" }
+automerge = "0.12"
+base64 = "0.22"
+iroh = "1.2.0"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
