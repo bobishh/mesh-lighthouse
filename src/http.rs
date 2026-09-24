@@ -62,7 +62,9 @@ struct Captcha {
 struct IncomingMessage {
     message: String,
     contact: String,
+    #[serde(default)]
     company: String,
+    #[serde(default)]
     role: String,
     human_check_token: String,
     human_check_answer: String,
@@ -190,9 +192,7 @@ async fn ingest(
         || input.message.len() > 8_000
         || input.contact.is_empty()
         || input.contact.len() > 500
-        || input.company.is_empty()
         || input.company.len() > 256
-        || input.role.is_empty()
         || input.role.len() > 256
     {
         return Err((StatusCode::BAD_REQUEST, "Check the form fields"));
@@ -301,12 +301,22 @@ async fn process_one(
         "{}\n\nContact: {}\nIntake: {}",
         input.message, input.contact, id
     );
+    let company = if input.company.is_empty() {
+        "Inbound lead".to_owned()
+    } else {
+        input.company
+    };
+    let role = if input.role.is_empty() {
+        "Job opportunity".to_owned()
+    } else {
+        input.role
+    };
     let (response, received) = oneshot::channel();
     sender
         .send(LeadRequest {
             lead_id: format!("item-{}", &id[..32]),
-            company: input.company,
-            role: input.role,
+            company,
+            role,
             body,
             response,
         })
@@ -509,5 +519,19 @@ mod tests {
             used: Arc::new(std::env::temp_dir()),
         };
         assert!(verify_captcha(&captcha, "bad.token", "7").is_err());
+    }
+
+    #[test]
+    fn compact_form_does_not_require_company_or_role() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "Senior backend role in Berlin",
+            "contact": "recruiter@example.com",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+
+        assert!(input.company.is_empty());
+        assert!(input.role.is_empty());
     }
 }
