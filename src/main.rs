@@ -332,7 +332,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                         match peer {
                             Ok(_) => {
-                                reconnects.clear_reconnect(route);
                                 let incoming_connection = Arc::clone(&connection);
                                 let incoming_service = Arc::clone(&service);
                                 let remote_id = route.clone();
@@ -384,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
             {
-                Ok(()) => {}
+                Ok(()) => reconnects.clear_reconnect(route),
                 Err(error) if error == "Unauthenticated mesh peer" => {}
                 Err(error) => {
                     eprintln!("Lighthouse publish to {route}: {error}");
