@@ -425,6 +425,7 @@ fn refresh_route(
         .map_err(|error| error.to_string())?;
     payload["issuedAt"] = Value::String(issued_at);
     payload["routeSequence"] = Value::from(sequence);
+    payload["deviceName"] = Value::String("Lighthouse".into());
     let signed = serde_json::to_value(sign_json_envelope(
         seed,
         payload.clone(),

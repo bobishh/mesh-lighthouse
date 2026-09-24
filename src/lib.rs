@@ -305,6 +305,8 @@ impl MatchScopeStore {
         if member.role == meta_mesh_core::WorkspaceRole::Visitor {
             return Err("Lighthouse needs chat.write permission".into());
         }
+        let state = self.snapshot()?;
+        let chat_scope = match_chat_scope(&state.document)?;
         let created_at = time::OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)
             .map_err(|error| error.to_string())?
             .format(time::macros::format_description!(
@@ -314,7 +316,7 @@ impl MatchScopeStore {
         let record_id = format!("{}:{}", member.payload.device_id, message_id);
         let record_for = |kind: &str, id: String, text: &str, revision: u64| {
             let payload = json!({
-                "kind": kind, "version": 1, "workspaceId": self.workspace_id,
+                "kind": kind, "version": 1, "workspaceId": chat_scope,
                 "personId": member.payload.person_id, "deviceId": member.payload.device_id,
                 "id": id, "createdAt": created_at, "text": text, "revision": revision,
             });
@@ -347,6 +349,10 @@ impl MatchScopeStore {
             .ok_or("Invalid stored chat")?;
         if messages.iter().any(|record| {
             record.pointer("/signed/payload/id").and_then(Value::as_str) == Some(record_id.as_str())
+                && record
+                    .pointer("/signed/payload/workspaceId")
+                    .and_then(Value::as_str)
+                    == Some(chat_scope.as_str())
         }) {
             return Ok(record_id);
         }
@@ -363,6 +369,10 @@ impl MatchScopeStore {
                         .pointer("/signed/payload/personId")
                         .and_then(Value::as_str)
                         == Some(member.payload.person_id.as_str())
+                        && record
+                            .pointer("/signed/payload/workspaceId")
+                            .and_then(Value::as_str)
+                            == Some(chat_scope.as_str())
                 })
             });
         if !has_profile {
@@ -374,6 +384,7 @@ impl MatchScopeStore {
             )?]);
         }
         let mut next = guard.state.clone();
+        retain_chat_scope(&mut next.chat, &chat_scope)?;
         next.chat = merge_chat(&next.chat, &batch)?;
         self.save(&mut guard, next)?;
         Ok(record_id)
@@ -411,6 +422,42 @@ impl MatchScopeStore {
         guard.state = next;
         Ok(())
     }
+}
+
+fn match_chat_scope(document: &[u8]) -> Result<String, String> {
+    let document =
+        AutoCommit::load(document).map_err(|error| format!("Invalid Match document: {error}"))?;
+    let view =
+        serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
+    let owner = view
+        .get("ownerPersonId")
+        .and_then(Value::as_str)
+        .ok_or("Match workspace has no owner")?;
+    let board_id = view
+        .get("entities")
+        .and_then(Value::as_object)
+        .and_then(|entities| {
+            entities.iter().find_map(|(id, entity)| {
+                (entity.get("kind").and_then(Value::as_str) == Some("board")).then_some(id)
+            })
+        })
+        .ok_or("Match workspace has no board")?;
+    Ok(format!("{owner}:{board_id}"))
+}
+
+fn retain_chat_scope(chat: &mut Value, scope: &str) -> Result<(), String> {
+    for section in ["messages", "profiles", "typing"] {
+        chat.get_mut(section)
+            .and_then(Value::as_array_mut)
+            .ok_or("Invalid stored chat")?
+            .retain(|record| {
+                record
+                    .pointer("/signed/payload/workspaceId")
+                    .and_then(Value::as_str)
+                    == Some(scope)
+            });
+    }
+    Ok(())
 }
 
 fn put_text(
@@ -813,9 +860,13 @@ mod tests {
             .put(ROOT, "ownerPersonId", person_id.clone())
             .unwrap();
         document.put(ROOT, "title", "Original").unwrap();
-        document
+        let entities = document
             .put_object(ROOT, "entities", automerge::ObjType::Map)
             .unwrap();
+        let board = document
+            .put_object(&entities, "board-1", automerge::ObjType::Map)
+            .unwrap();
+        document.put(&board, "kind", "board").unwrap();
         let baseline = document.save();
         let initial_hashes = document
             .get_changes(&[])
@@ -850,7 +901,7 @@ mod tests {
                     Some(&json!({
                         "version": 1, "records": [], "authority": evidence,
                     })),
-                    &[new_hash.clone()]
+                    std::slice::from_ref(&new_hash)
                 )
                 .is_err()
         );
@@ -895,6 +946,11 @@ mod tests {
             chat.pointer("/profiles/0/signed/payload/text")
                 .and_then(Value::as_str),
             Some("Lighthouse")
+        );
+        assert_eq!(
+            chat.pointer("/messages/0/signed/payload/workspaceId")
+                .and_then(Value::as_str),
+            Some(format!("{person_id}:board-1").as_str())
         );
         store.merge_mesh(&json!({"version":1,"peers":[peer, {"advertisement":{"payload":{"endpoint":"fake"}}}],
             "revocations":[]})).unwrap();

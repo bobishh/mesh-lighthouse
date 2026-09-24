@@ -297,7 +297,7 @@ async fn process_one(
         write_json(&result_path, &result)?;
         result
     };
-    if matches!(result.status.as_str(), "chat_posted" | "card_created") {
+    if matches!(result.status.as_str(), "chat_queued" | "card_created_v2") {
         return Ok(());
     }
     let Some(sender) = lead_sender else {
@@ -311,25 +311,16 @@ async fn process_one(
         input.message, input.contact, id
     );
     let verdict = assessment_summary(&result.assessment);
-    let company = if input.company.is_empty() {
-        "Inbound lead".to_owned()
-    } else {
-        input.company
-    };
-    let role = if input.role.is_empty() {
-        "Job opportunity".to_owned()
-    } else {
-        input.role
-    };
+    let create_card = should_create_card(&input, &result.assessment);
     let (response, received) = oneshot::channel();
     sender
         .send(LeadRequest {
             lead_id: format!("item-{}", &id[..32]),
-            company,
-            role,
+            company: input.company,
+            role: input.role,
             body,
             verdict,
-            create_card: result.assessment.choice == "yes",
+            create_card,
             response,
         })
         .await
@@ -338,13 +329,17 @@ async fn process_one(
         .await
         .map_err(|_| "Match writer stopped".to_owned())??;
     result.status = if card_id.is_some() {
-        "card_created"
+        "card_created_v2"
     } else {
-        "chat_posted"
+        "chat_queued"
     }
     .to_owned();
     result.card_id = card_id;
     write_json(&result_path, &result)
+}
+
+fn should_create_card(input: &IncomingMessage, assessment: &Assessment) -> bool {
+    assessment.choice == "yes" && !input.company.trim().is_empty() && !input.role.trim().is_empty()
 }
 
 fn jev_client() -> Result<TypeSafeClient, String> {
@@ -676,6 +671,50 @@ mod tests {
 
         assert!(input.company.is_empty());
         assert!(input.role.is_empty());
+    }
+
+    #[test]
+    fn compact_form_cannot_create_an_untitled_board_card() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "This might be a relevant vacancy",
+            "contact": "recruiter@example.com",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+        let assessment = Assessment {
+            choice: "yes".into(),
+            confidence: 0.9,
+            probabilities: BTreeMap::new(),
+            role_type: None,
+            seniority: None,
+            model: JEV_MODEL.into(),
+        };
+
+        assert!(!should_create_card(&input, &assessment));
+    }
+
+    #[test]
+    fn classified_structured_vacancy_can_create_a_board_card() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "A real vacancy",
+            "contact": "recruiter@example.com",
+            "company": "Pennylane",
+            "role": "Senior backend engineer",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+        let assessment = Assessment {
+            choice: "yes".into(),
+            confidence: 0.9,
+            probabilities: BTreeMap::new(),
+            role_type: None,
+            seniority: None,
+            model: JEV_MODEL.into(),
+        };
+
+        assert!(should_create_card(&input, &assessment));
     }
 
     #[test]

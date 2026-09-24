@@ -1,19 +1,25 @@
-use std::{fs, io::Write, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId};
-use match_lighthouse::{now_ms, MatchLighthouseState, MatchScopeStore};
+use match_lighthouse::{MatchLighthouseState, MatchScopeStore, now_ms};
 use meta_mesh_core::{
-    decode_workspace_set, parse_invitation, public_key_from_seed, public_key_id,
-    sign_device_certificate, sign_json_envelope, verify_workspace_grant,
-    verify_workspace_member_bundle, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
+    DEFAULT_SIGNATURE_DOMAIN, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
     PublicIdentity, ScopedInvitation, VerifyWorkspaceMemberOptions, WorkspaceGrant,
-    WorkspaceJoinHandshake, WorkspaceJoinResponse, WorkspaceRole, DEFAULT_SIGNATURE_DOMAIN,
+    WorkspaceJoinHandshake, WorkspaceJoinResponse, WorkspaceRole, decode_workspace_set,
+    parse_invitation, public_key_from_seed, public_key_id, sign_device_certificate,
+    sign_json_envelope, verify_workspace_grant, verify_workspace_member_bundle,
 };
 use meta_mesh_native::{NativeNode, NativeNodeOptions, NativeScopeHost};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use time::{macros::format_description, OffsetDateTime};
+use serde_json::{Value, json};
+use time::{OffsetDateTime, macros::format_description};
 
 use crate::Config;
 
@@ -152,7 +158,7 @@ fn guest_bundle(
             "deviceId": device_id, "endpoint": endpoint,
             "issuedAt": OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)?
                 .format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"))?,
-            "deviceName": "mesh-lighthouse",
+            "deviceName": "Lighthouse",
         }),
         device_id,
         DEFAULT_SIGNATURE_DOMAIN,
@@ -172,7 +178,7 @@ fn guest_bundle(
 fn prepare_config(
     invite: &meta_mesh_core::WorkspaceJoinInvitation,
     response: &[u8],
-    directory: &PathBuf,
+    directory: &Path,
     person_id: &str,
     device_id: &str,
     bundle: &Value,
@@ -251,7 +257,7 @@ fn prepare_config(
         return Err("Invitation issuer does not match signed owner route".into());
     }
     let workspace_set = URL_SAFE_NO_PAD.decode(received.snapshot)?;
-    let entries = decode_workspace_set(&workspace_set, &[invite.workspace_id.clone()])?;
+    let entries = decode_workspace_set(&workspace_set, std::slice::from_ref(&invite.workspace_id))?;
     let entry = &entries[0];
     let mut state = MatchLighthouseState {
         document: URL_SAFE_NO_PAD.decode(&entry.bytes)?,
