@@ -272,7 +272,8 @@ impl MatchScopeStore {
         proof.get_mut("records").and_then(Value::as_array_mut)
             .ok_or("Missing Match write authorizations")?
             .push(json!({"signed":signed,"publicKey":member.public_key,"certificates":member.certificates,
-                "grant":member.grant}));
+                "grant":member.grant,"ownerPublicKey":member.owner_public_key,
+                "ownerCertificates":member.owner_certificates}));
         self.persist_document(&document.save(), Some(&proof), &[hash])?;
         Ok(id)
     }
