@@ -50,6 +50,14 @@ pub struct MatchScopeStore {
     inner: Arc<Mutex<Inner>>,
 }
 
+pub struct LeadDraft<'a> {
+    pub id: &'a str,
+    pub company: &'a str,
+    pub role: &'a str,
+    pub job_url: &'a str,
+    pub body: &'a str,
+}
+
 impl MatchScopeStore {
     pub fn open(
         workspace_id: String,
@@ -129,22 +137,24 @@ impl MatchScopeStore {
         &mut self,
         peer: &Value,
         device_seed: &[u8; 32],
-        lead_id: &str,
-        company: &str,
-        role: &str,
-        body: &str,
+        draft: LeadDraft<'_>,
     ) -> Result<String, String> {
-        let company = company.trim();
-        let role = role.trim();
+        let lead_id = draft.id;
+        let company = draft.company.trim();
+        let role = draft.role.trim();
+        let job_url = draft.job_url.trim();
+        let body = draft.body;
         if company.is_empty()
             || role.is_empty()
+            || job_url.is_empty()
             || company.len() > 256
             || role.len() > 256
+            || job_url.len() > 2_048
             || body.len() > 8_500
             || !lead_id.starts_with("item-")
             || lead_id.len() > 80
         {
-            return Err("Lead needs company and role (up to 256 characters each)".into());
+            return Err("Lead needs company, role, and job URL".into());
         }
         let authority = self.authority()?;
         let member = verify_workspace_member_bundle(
@@ -195,6 +205,7 @@ impl MatchScopeStore {
         let column_id = binding("status.lead")?;
         let company_field = binding("field.company")?;
         let role_field = binding("field.role")?;
+        let url_field = binding("field.url")?;
         if entities
             .get(column_id)
             .and_then(|entity| entity.get("kind"))
@@ -245,6 +256,7 @@ impl MatchScopeStore {
             .map_err(|error| error.to_string())?;
         put_text(&mut document, &values, company_field, company)?;
         put_text(&mut document, &values, role_field, role)?;
+        put_text(&mut document, &values, url_field, job_url)?;
         let message = json!({"version":1,"transactionId":id,"action":"createItem","entityIds":[id],
             "personId":member.payload.person_id,"deviceId":member.payload.device_id})
         .to_string();

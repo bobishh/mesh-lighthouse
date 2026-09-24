@@ -9,7 +9,9 @@ use std::{
 };
 
 use iroh::{EndpointAddr, EndpointId};
-use match_lighthouse::{MatchLighthouseHost, MatchLighthouseState, MatchScopeStore, now_ms};
+use match_lighthouse::{
+    LeadDraft, MatchLighthouseHost, MatchLighthouseState, MatchScopeStore, now_ms,
+};
 use meta_mesh_core::{
     DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshRuntimeState, VerifyWorkspaceMemberOptions,
     sign_json_envelope, verify_workspace_member_bundle,
@@ -166,10 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 .create_lead(
                                     &lead_peer,
                                     &lead_seed,
-                                    &request.lead_id,
-                                    &request.company,
-                                    &request.role,
-                                    &request.body,
+                                    LeadDraft {
+                                        id: &request.lead_id,
+                                        company: &request.company,
+                                        role: &request.role,
+                                        job_url: &request.job_url,
+                                        body: &request.body,
+                                    },
                                 )
                                 .map(Some)
                         } else {

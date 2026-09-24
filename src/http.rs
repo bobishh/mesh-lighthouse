@@ -32,6 +32,7 @@ pub struct LeadRequest {
     pub lead_id: String,
     pub company: String,
     pub role: String,
+    pub job_url: String,
     pub body: String,
     pub verdict: String,
     pub create_card: bool,
@@ -68,6 +69,8 @@ struct IncomingMessage {
     company: String,
     #[serde(default)]
     role: String,
+    #[serde(default)]
+    job_url: String,
     human_check_token: String,
     human_check_answer: String,
 }
@@ -203,13 +206,16 @@ async fn ingest(
     input.contact = input.contact.trim().to_owned();
     input.company = input.company.trim().to_owned();
     input.role = input.role.trim().to_owned();
+    input.job_url = input.job_url.trim().to_owned();
     input.human_check_answer = input.human_check_answer.trim().to_owned();
-    if input.message.is_empty()
-        || input.message.len() > 8_000
+    if input.message.len() > 8_000
         || input.contact.is_empty()
         || input.contact.len() > 500
+        || input.company.is_empty()
         || input.company.len() > 256
+        || input.role.is_empty()
         || input.role.len() > 256
+        || !valid_job_url(&input.job_url)
     {
         return Err((StatusCode::BAD_REQUEST, "Check the form fields"));
     }
@@ -306,10 +312,7 @@ async fn process_one(
     let input: IncomingMessage =
         serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|_| "Invalid inbox message".to_owned())?;
-    let body = format!(
-        "{}\n\nContact: {}\nIntake: {}",
-        input.message, input.contact, id
-    );
+    let body = lead_body(&input, id);
     let verdict = assessment_summary(&result.assessment);
     let create_card = should_create_card(&input, &result.assessment);
     let (response, received) = oneshot::channel();
@@ -318,6 +321,7 @@ async fn process_one(
             lead_id: format!("item-{}", &id[..32]),
             company: input.company,
             role: input.role,
+            job_url: input.job_url,
             body,
             verdict,
             create_card,
@@ -339,7 +343,28 @@ async fn process_one(
 }
 
 fn should_create_card(input: &IncomingMessage, assessment: &Assessment) -> bool {
-    assessment.choice == "yes" && !input.company.trim().is_empty() && !input.role.trim().is_empty()
+    assessment.choice == "yes"
+        && !input.company.trim().is_empty()
+        && !input.role.trim().is_empty()
+        && valid_job_url(&input.job_url)
+}
+
+fn valid_job_url(value: &str) -> bool {
+    value.len() <= 2_048
+        && (value.starts_with("https://") || value.starts_with("http://"))
+        && !value.contains(char::is_whitespace)
+}
+
+fn lead_body(input: &IncomingMessage, id: &str) -> String {
+    let mut lines = vec![
+        input.job_url.clone(),
+        format!("Contact: {}", input.contact),
+        format!("Intake: {id}"),
+    ];
+    if !input.message.is_empty() {
+        lines.insert(1, input.message.clone());
+    }
+    lines.join("\n\n")
 }
 
 fn jev_client() -> Result<TypeSafeClient, String> {
@@ -398,7 +423,7 @@ async fn classify(client: &TypeSafeClient, input: &IncomingMessage) -> Result<As
     })).map_err(|_| "Invalid Jev question".to_owned())?;
     let response = client
         .system_one(
-            json!({"company": input.company, "role": input.role, "message": input.message}),
+            json!({"company": input.company, "role": input.role, "jobUrl": input.job_url, "message": input.message}),
             questions,
         )
         .await
@@ -660,17 +685,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_form_does_not_require_company_or_role() {
+    fn structured_job_form_deserializes() {
         let input: IncomingMessage = serde_json::from_value(json!({
-            "message": "Senior backend role in Berlin",
+            "message": "Remote in Germany",
             "contact": "recruiter@example.com",
+            "company": "Pennylane",
+            "role": "Senior backend engineer",
+            "jobUrl": "https://example.com/jobs/123",
             "humanCheckToken": "token",
             "humanCheckAnswer": "4"
         }))
         .unwrap();
 
-        assert!(input.company.is_empty());
-        assert!(input.role.is_empty());
+        assert_eq!(input.company, "Pennylane");
+        assert_eq!(input.role, "Senior backend engineer");
+        assert_eq!(input.job_url, "https://example.com/jobs/123");
     }
 
     #[test]
@@ -678,6 +707,8 @@ mod tests {
         let input: IncomingMessage = serde_json::from_value(json!({
             "message": "This might be a relevant vacancy",
             "contact": "recruiter@example.com",
+            "company": "Pennylane",
+            "role": "Senior backend engineer",
             "humanCheckToken": "token",
             "humanCheckAnswer": "4"
         }))
@@ -701,6 +732,7 @@ mod tests {
             "contact": "recruiter@example.com",
             "company": "Pennylane",
             "role": "Senior backend engineer",
+            "jobUrl": "https://example.com/jobs/123",
             "humanCheckToken": "token",
             "humanCheckAnswer": "4"
         }))
@@ -715,6 +747,25 @@ mod tests {
         };
 
         assert!(should_create_card(&input, &assessment));
+    }
+
+    #[test]
+    fn lead_body_keeps_url_separate_from_optional_note() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "Remote in Germany",
+            "contact": "recruiter@example.com",
+            "company": "Pennylane",
+            "role": "Senior backend engineer",
+            "jobUrl": "https://example.com/jobs/123",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            lead_body(&input, "abc"),
+            "https://example.com/jobs/123\n\nRemote in Germany\n\nContact: recruiter@example.com\n\nIntake: abc"
+        );
     }
 
     #[test]
