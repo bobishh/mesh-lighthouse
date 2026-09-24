@@ -16,7 +16,7 @@ mesh-lighthouse join INVITE_URL STATE_DIR
 mesh-lighthouse STATE_DIR/config.json
 ```
 
-`config.json`, `state.json`, and `route-sequence` contain private identity or board state. Keep `STATE_DIR` private and durable. `create-lead CONFIG.json COMPANY ROLE` signs a Match lead while the service is stopped.
+`config.json`, `state.json`, and `route-sequence` contain private identity or board state. Keep `STATE_DIR` private and durable.
 
 The HTTP intake runs independently before a mesh identity is paired:
 
@@ -26,7 +26,7 @@ curl -X POST -H 'Content-Type: application/json' \
   -d '{"message":"Hello","contact":"me@example.com"}' http://127.0.0.1:8080/ingest
 ```
 
-`GET /challenge` issues a short-lived signed human check. `POST /ingest` verifies it, durably stores a bounded JSON message under `STATE_DIR/inbox`, and returns `202` with `status: pending`. A background worker classifies pending messages with Jev. High-confidence job invitations remain queued until the native process is paired, then become idempotent Match lead cards. `GET /health` supports the deploy proxy. When the native mesh process is paired, `LIGHTHOUSE_HTTP_BIND=0.0.0.0:8080 mesh-lighthouse STATE_DIR/config.json` serves and processes the same inbox alongside replication.
+`GET /challenge` issues a short-lived signed human check. `POST /ingest` verifies it, durably stores a bounded JSON message under `STATE_DIR/inbox`, and returns `202` with `status: pending`. A background worker classifies opportunity relevance, role type, and seniority with Jev, retaining every probability distribution. Once paired, every intake is posted to workspace chat; relevant opportunities also become idempotent Match lead cards. `GET /health` supports the deploy proxy. When the native mesh process is paired, `LIGHTHOUSE_HTTP_BIND=0.0.0.0:8080 mesh-lighthouse STATE_DIR/config.json` serves and processes the same inbox alongside replication.
 
 The container starts in HTTP-only mode. An owner-issued single-workspace invitation can initialize the existing `/data` volume without deleting its inbox. Restart the container after `join` succeeds; it then runs the native mesh peer and HTTP intake together. A failed join removes only its incomplete mesh state, leaving queued messages intact. Invite secrets must not be logged or committed.
 

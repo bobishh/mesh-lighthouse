@@ -72,36 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         return http::serve(directory, address, None).await;
     }
-    if path == "create-lead" {
-        let config_path = args.next().ok_or("Missing lighthouse config path")?;
-        let company = args.next().ok_or("Missing lead company")?;
-        let role = args.next().ok_or("Missing lead role")?;
-        if args.next().is_some() {
-            return Err("Too many create-lead arguments".into());
-        }
-        let config: Config = serde_json::from_slice(&fs::read(config_path)?)?;
-        let seed: [u8; 32] = config
-            .device_seed
-            .as_slice()
-            .try_into()
-            .map_err(|_| "Lighthouse device seed must contain 32 bytes")?;
-        let mut store = MatchScopeStore::open(
-            config.workspace_id,
-            config.genesis_person_id,
-            config.state_path,
-            config.initial_state,
-        )?;
-        let id = store.create_lead(
-            &config.local_handshake.peer,
-            &seed,
-            &format!("item-{:032x}", rand::random::<u128>()),
-            &company,
-            &role,
-            "",
-        )?;
-        println!("Created lead {id}");
-        return Ok(());
-    }
     if args.next().is_some() {
         return Err("Too many arguments".into());
     }
@@ -181,14 +151,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let lead_seed = device_seed;
         tokio::spawn(async move {
             while let Some(request) = lead_receiver.recv().await {
-                let result = lead_service.lock().await.host_mut().store.create_lead(
-                    &lead_peer,
-                    &lead_seed,
-                    &request.lead_id,
-                    &request.company,
-                    &request.role,
-                    &request.body,
-                );
+                let mut service = lead_service.lock().await;
+                let store = &mut service.host_mut().store;
+                let result = store
+                    .create_chat_message(
+                        &lead_peer,
+                        &lead_seed,
+                        &request.lead_id,
+                        &format!("New lead\n\n{}\n\n{}", request.body, request.verdict),
+                    )
+                    .and_then(|_| {
+                        if request.create_card {
+                            store
+                                .create_lead(
+                                    &lead_peer,
+                                    &lead_seed,
+                                    &request.lead_id,
+                                    &request.company,
+                                    &request.role,
+                                    &request.body,
+                                )
+                                .map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    });
                 let _ = request.response.send(result);
             }
         });

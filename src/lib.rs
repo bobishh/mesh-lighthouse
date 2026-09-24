@@ -277,6 +277,107 @@ impl MatchScopeStore {
         Ok(id)
     }
 
+    pub fn create_chat_message(
+        &mut self,
+        peer: &Value,
+        device_seed: &[u8; 32],
+        message_id: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        let body = body.trim();
+        if body.is_empty() || body.chars().count() > 8_000 || message_id.len() > 80 {
+            return Err("Chat message must contain 1–8,000 characters".into());
+        }
+        let authority = self.authority()?;
+        let member = verify_workspace_member_bundle(
+            peer.clone(),
+            VerifyWorkspaceMemberOptions {
+                workspace_id: Some(self.workspace_id.clone()),
+                owner_person_id: Some(authority.expected_current_owner.person_id.clone()),
+                owner_public_key: Some(authority.expected_current_owner.public_key.clone()),
+                owner_certificates: authority.expected_current_owner.certificates.clone(),
+                owner_history: vec![authority.genesis_owner.clone()],
+                ..Default::default()
+            },
+            now_ms()?,
+        )?;
+        if member.role == meta_mesh_core::WorkspaceRole::Visitor {
+            return Err("Lighthouse needs chat.write permission".into());
+        }
+        let created_at = time::OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)
+            .map_err(|error| error.to_string())?
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+            ))
+            .map_err(|error| error.to_string())?;
+        let record_id = format!("{}:{}", member.payload.device_id, message_id);
+        let record_for = |kind: &str, id: String, text: &str, revision: u64| {
+            let payload = json!({
+                "kind": kind, "version": 1, "workspaceId": self.workspace_id,
+                "personId": member.payload.person_id, "deviceId": member.payload.device_id,
+                "id": id, "createdAt": created_at, "text": text, "revision": revision,
+            });
+            let signed = sign_json_envelope(
+                device_seed,
+                payload,
+                &member.payload.device_id,
+                DEFAULT_SIGNATURE_DOMAIN,
+            )?;
+            Ok::<Value, String>(json!({
+                "signed": signed,
+                "publicKey": member.public_key,
+                "certificates": member.certificates,
+                "authority": {
+                    "publicKey": member.owner_public_key,
+                    "certificates": member.owner_certificates,
+                    "grant": member.grant,
+                }
+            }))
+        };
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?;
+        let messages = guard
+            .state
+            .chat
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or("Invalid stored chat")?;
+        if messages.iter().any(|record| {
+            record.pointer("/signed/payload/id").and_then(Value::as_str) == Some(record_id.as_str())
+        }) {
+            return Ok(record_id);
+        }
+        let mut batch = json!({"version": 1, "messages": [], "profiles": [], "typing": []});
+        batch["messages"] = json!([record_for("chat-message", record_id.clone(), body, 0)?]);
+        let has_profile = guard
+            .state
+            .chat
+            .get("profiles")
+            .and_then(Value::as_array)
+            .is_some_and(|profiles| {
+                profiles.iter().any(|record| {
+                    record
+                        .pointer("/signed/payload/personId")
+                        .and_then(Value::as_str)
+                        == Some(member.payload.person_id.as_str())
+                })
+            });
+        if !has_profile {
+            batch["profiles"] = json!([record_for(
+                "chat-profile",
+                format!("{}:lighthouse-profile", member.payload.device_id),
+                "Lighthouse",
+                1,
+            )?]);
+        }
+        let mut next = guard.state.clone();
+        next.chat = merge_chat(&next.chat, &batch)?;
+        self.save(&mut guard, next)?;
+        Ok(record_id)
+    }
+
     fn authority_for(
         &self,
         state: &MatchLighthouseState,
@@ -780,6 +881,20 @@ mod tests {
         .unwrap();
         let peer = json!({"advertisement":advertisement,"publicKey":public_key,
             "certificates":[certificate]});
+        let message_id = store
+            .create_chat_message(&peer, &[2; 32], "intake-test", "New lead")
+            .unwrap();
+        let chat = store.snapshot().unwrap().chat.unwrap();
+        assert_eq!(
+            chat.pointer("/messages/0/signed/payload/id")
+                .and_then(Value::as_str),
+            Some(message_id.as_str())
+        );
+        assert_eq!(
+            chat.pointer("/profiles/0/signed/payload/text")
+                .and_then(Value::as_str),
+            Some("Lighthouse")
+        );
         store.merge_mesh(&json!({"version":1,"peers":[peer, {"advertisement":{"payload":{"endpoint":"fake"}}}],
             "revocations":[]})).unwrap();
         assert_eq!(
