@@ -431,6 +431,8 @@ fn refresh_route(
     payload["issuedAt"] = Value::String(issued_at);
     payload["routeSequence"] = Value::from(sequence);
     payload["deviceName"] = Value::String("Lighthouse".into());
+    payload["userAgent"] =
+        Value::String(concat!("mesh-lighthouse/", env!("CARGO_PKG_VERSION")).into());
     let signed = serde_json::to_value(sign_json_envelope(
         seed,
         payload.clone(),

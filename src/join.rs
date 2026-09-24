@@ -159,6 +159,7 @@ fn guest_bundle(
             "issuedAt": OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)?
                 .format(format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"))?,
             "deviceName": "Lighthouse",
+            "userAgent": concat!("mesh-lighthouse/", env!("CARGO_PKG_VERSION")),
         }),
         device_id,
         DEFAULT_SIGNATURE_DOMAIN,
