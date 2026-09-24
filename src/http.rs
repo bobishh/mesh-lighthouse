@@ -354,7 +354,7 @@ async fn process_one(
         write_json(&result_path, &result)?;
     }
     if matches!(result.status.as_str(), "chat_queued" | "card_created_v2") {
-        return Ok(());
+        return remove_inbox(path);
     }
     let Some(sender) = lead_sender else {
         return Ok(());
@@ -386,7 +386,8 @@ async fn process_one(
     }
     .to_owned();
     result.card_id = card_id;
-    write_json(&result_path, &result)
+    write_json(&result_path, &result)?;
+    remove_inbox(path)
 }
 
 fn should_create_card(input: &IncomingMessage, result: &ProcessingResult) -> bool {
@@ -897,6 +898,16 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn remove_inbox(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+        fs::File::open(path.parent().ok_or("Invalid inbox path")?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn atomic_write(directory: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = directory.join(format!(".{}.tmp", rand::random::<u64>()));
     let mut options = fs::OpenOptions::new();
@@ -1150,6 +1161,21 @@ mod tests {
             lead_body(&input, "abc"),
             "https://example.com/jobs/123\n\nSignal: recruiter.42\n\nIntake: abc"
         );
+    }
+
+    #[test]
+    fn completed_intake_is_removed_from_the_active_inbox() {
+        let root =
+            std::env::temp_dir().join(format!("lighthouse-complete-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("lead.json");
+        fs::write(&path, b"pending").unwrap();
+
+        remove_inbox(&path).unwrap();
+
+        assert!(!path.exists());
+        remove_inbox(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
