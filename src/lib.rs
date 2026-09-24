@@ -6,22 +6,22 @@ use std::{
 };
 
 use automerge::{
+    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc,
     transaction::{CommitOptions, Transactable},
-    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ReadDoc, ROOT,
 };
 use match_authority::{admit_match_candidate, prepare_match_write_authority};
 use meta_mesh_core::{
-    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
-    verify_workspace_member_bundle, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
+    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
     WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot,
-    DEFAULT_SIGNATURE_DOMAIN,
+    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
+    verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
     FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
     NativeScopeSnapshot,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,12 +129,21 @@ impl MatchScopeStore {
         &mut self,
         peer: &Value,
         device_seed: &[u8; 32],
+        lead_id: &str,
         company: &str,
         role: &str,
+        body: &str,
     ) -> Result<String, String> {
         let company = company.trim();
         let role = role.trim();
-        if company.is_empty() || role.is_empty() || company.len() > 256 || role.len() > 256 {
+        if company.is_empty()
+            || role.is_empty()
+            || company.len() > 256
+            || role.len() > 256
+            || body.len() > 8_500
+            || !lead_id.starts_with("item-")
+            || lead_id.len() > 80
+        {
             return Err("Lead needs company and role (up to 256 characters each)".into());
         }
         let authority = self.authority()?;
@@ -163,6 +172,9 @@ impl MatchScopeStore {
             .get("entities")
             .and_then(Value::as_object)
             .ok_or("Invalid Match entities")?;
+        if entities.contains_key(lead_id) {
+            return Ok(lead_id.to_owned());
+        }
         let board = entities
             .values()
             .find(|entity| {
@@ -195,7 +207,7 @@ impl MatchScopeStore {
             .get(ROOT, "entities")
             .map_err(|error| error.to_string())?
             .ok_or("Missing Match entities")?;
-        let id = format!("item-{:032x}", rand::random::<u128>());
+        let id = lead_id.to_owned();
         let now = time::OffsetDateTime::from_unix_timestamp_nanos(now_ms()? * 1_000_000)
             .map_err(|error| error.to_string())?
             .format(time::macros::format_description!(
@@ -212,7 +224,7 @@ impl MatchScopeStore {
             "title",
             &format!("{company} — {role}"),
         )?;
-        put_text(&mut document, &item, "body", "")?;
+        put_text(&mut document, &item, "body", body)?;
         document
             .put(&item, "deleted", false)
             .map_err(|error| error.to_string())?;
@@ -635,11 +647,11 @@ pub fn now_ms() -> Result<i128, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use automerge::{transaction::Transactable, ROOT};
+    use automerge::{ROOT, transaction::Transactable};
     use meta_mesh_core::{
-        public_key_from_seed, public_key_id, sign_device_certificate, sign_json_envelope,
-        DeviceCertificatePayload, WorkspaceAuthority, WorkspaceChangeAuthorizationPayload,
-        DEFAULT_SIGNATURE_DOMAIN,
+        DEFAULT_SIGNATURE_DOMAIN, DeviceCertificatePayload, WorkspaceAuthority,
+        WorkspaceChangeAuthorizationPayload, public_key_from_seed, public_key_id,
+        sign_device_certificate, sign_json_envelope,
     };
 
     #[test]
@@ -729,15 +741,17 @@ mod tests {
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
         let new_hash = document.get_heads()[0].to_string();
-        assert!(store
-            .persist_document(
-                &candidate,
-                Some(&json!({
-                    "version": 1, "records": [], "authority": evidence,
-                })),
-                &[new_hash.clone()]
-            )
-            .is_err());
+        assert!(
+            store
+                .persist_document(
+                    &candidate,
+                    Some(&json!({
+                        "version": 1, "records": [], "authority": evidence,
+                    })),
+                    &[new_hash.clone()]
+                )
+                .is_err()
+        );
         assert_eq!(store.snapshot().unwrap().document, baseline);
         store
             .persist_document(
@@ -746,9 +760,11 @@ mod tests {
                 &[document.get_heads()[0].to_string()],
             )
             .unwrap();
-        assert!(store
-            .persist_document(&baseline, Some(&initial.authorization), &[])
-            .is_err());
+        assert!(
+            store
+                .persist_document(&baseline, Some(&initial.authorization), &[])
+                .is_err()
+        );
         assert_eq!(store.snapshot().unwrap().document, candidate);
         let issued_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -770,9 +786,11 @@ mod tests {
             store.authorized_peer_endpoints().unwrap(),
             vec!["signed-route"]
         );
-        assert!(store
-            .merge_mesh(&json!({"version":1,"peers":[],"revocations":[{}]}))
-            .is_err());
+        assert!(
+            store
+                .merge_mesh(&json!({"version":1,"peers":[],"revocations":[{}]}))
+                .is_err()
+        );
         let mut reopened =
             MatchScopeStore::open("board".into(), person_id, path.clone(), initial).unwrap();
         assert_eq!(reopened.snapshot().unwrap().document, candidate);

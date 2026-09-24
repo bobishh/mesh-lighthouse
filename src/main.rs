@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if args.next().is_some() {
             return Err("Too many serve-http arguments".into());
         }
-        return http::serve(directory, address).await;
+        return http::serve(directory, address, None).await;
     }
     if path == "create-lead" {
         let config_path = args.next().ok_or("Missing lighthouse config path")?;
@@ -91,7 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.state_path,
             config.initial_state,
         )?;
-        let id = store.create_lead(&config.local_handshake.peer, &seed, &company, &role)?;
+        let id = store.create_lead(
+            &config.local_handshake.peer,
+            &seed,
+            &format!("item-{:032x}", rand::random::<u128>()),
+            &company,
+            &role,
+            "",
+        )?;
         println!("Created lead {id}");
         return Ok(());
     }
@@ -99,19 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err("Too many arguments".into());
     }
     let config: Config = serde_json::from_slice(&fs::read(path)?)?;
-    if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
-        let directory = config
-            .state_path
-            .parent()
-            .ok_or("Invalid lighthouse state path")?
-            .to_path_buf();
-        let address: SocketAddr = bind.parse()?;
-        tokio::spawn(async move {
-            if let Err(error) = http::serve(directory, address).await {
-                eprintln!("Lighthouse HTTP: {error}");
-            }
-        });
-    }
     let device_seed: [u8; 32] = config
         .device_seed
         .as_slice()
@@ -139,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let store = MatchScopeStore::open(
         config.workspace_id.clone(),
         config.genesis_person_id.clone(),
-        config.state_path,
+        config.state_path.clone(),
         config.initial_state,
     )?;
     let authority = store.authority()?;
@@ -168,6 +162,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         store,
     };
     let service = Arc::new(Mutex::new(NativeScopeService::new(host)));
+    if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
+        let directory = config
+            .state_path
+            .parent()
+            .ok_or("Invalid lighthouse state path")?
+            .to_path_buf();
+        let address: SocketAddr = bind.parse()?;
+        let (lead_sender, mut lead_receiver) = tokio::sync::mpsc::channel::<http::LeadRequest>(16);
+        let lead_service = Arc::clone(&service);
+        let lead_peer = lead_service
+            .lock()
+            .await
+            .host_mut()
+            .local_handshake
+            .peer
+            .clone();
+        let lead_seed = device_seed;
+        tokio::spawn(async move {
+            while let Some(request) = lead_receiver.recv().await {
+                let result = lead_service.lock().await.host_mut().store.create_lead(
+                    &lead_peer,
+                    &lead_seed,
+                    &request.lead_id,
+                    &request.company,
+                    &request.role,
+                    &request.body,
+                );
+                let _ = request.response.send(result);
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(error) = http::serve(directory, address, Some(lead_sender)).await {
+                eprintln!("Lighthouse HTTP: {error}");
+            }
+        });
+    }
     let incoming_node = Arc::clone(&node);
     let incoming_service = Arc::clone(&service);
     tokio::spawn(async move {

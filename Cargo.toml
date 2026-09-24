@@ -14,11 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
+hmac = "0.12"
+jev-sdk = "=0.1.0"
 match-authority = { path = "vendor/match/crates/match-authority" }
 meta-mesh-core = { path = "vendor/match/vendor/meta-mesh/crates/meta-mesh-core" }
 meta-mesh-native = { path = "vendor/match/vendor/meta-mesh/crates/meta-mesh-native" }
 automerge = "0.12"
-base64 = "0.22"
 iroh = "1.2.0"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
