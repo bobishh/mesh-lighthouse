@@ -18,6 +18,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use jev_sdk::{Question, RetryPolicy, TypeSafeClient};
 use rand::Rng;
+use reqwest::{Url, header::LOCATION, redirect::Policy};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -27,6 +29,7 @@ use tower_http::cors::CorsLayer;
 const MAX_PENDING: usize = 1_000;
 const CAPTCHA_TTL_SECONDS: u64 = 5 * 60;
 const JEV_MODEL: &str = "jev-1.13.0";
+const MAX_JOB_PAGE_BYTES: usize = 1_000_000;
 
 pub struct LeadRequest {
     pub lead_id: String,
@@ -64,6 +67,7 @@ struct Captcha {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IncomingMessage {
     message: String,
+    #[serde(default)]
     contact: String,
     #[serde(default)]
     company: String,
@@ -124,8 +128,19 @@ struct ChoiceBreakdown {
 struct ProcessingResult {
     assessment: Assessment,
     status: String,
+    #[serde(default)]
+    company: String,
+    #[serde(default)]
+    role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     card_id: Option<String>,
+}
+
+#[derive(Default)]
+struct JobPage {
+    company: String,
+    role: String,
+    context: Value,
 }
 
 pub async fn serve(
@@ -209,11 +224,8 @@ async fn ingest(
     input.job_url = input.job_url.trim().to_owned();
     input.human_check_answer = input.human_check_answer.trim().to_owned();
     if input.message.len() > 8_000
-        || input.contact.is_empty()
         || input.contact.len() > 500
-        || input.company.is_empty()
         || input.company.len() > 256
-        || input.role.is_empty()
         || input.role.len() > 256
         || !valid_job_url(&input.job_url)
     {
@@ -284,6 +296,9 @@ async fn process_one(
     id: &str,
     path: &Path,
 ) -> Result<(), String> {
+    let input: IncomingMessage =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|_| "Invalid inbox message".to_owned())?;
     let result_path = inbox.results.join(format!("{id}.json"));
     let mut result = if result_path.exists() {
         serde_json::from_slice::<ProcessingResult>(
@@ -291,36 +306,68 @@ async fn process_one(
         )
         .map_err(|_| "Invalid saved intake result".to_owned())?
     } else {
-        let input: IncomingMessage =
-            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                .map_err(|_| "Invalid inbox message".to_owned())?;
-        let assessment = classify(client.as_ref().map_err(Clone::clone)?, &input).await?;
+        let page = fetch_job_page(&input.job_url).await.unwrap_or_default();
+        let company = if input.company.is_empty() {
+            page.company
+        } else {
+            input.company.clone()
+        };
+        let role = if input.role.is_empty() {
+            page.role
+        } else {
+            input.role.clone()
+        };
+        let assessment = classify(
+            client.as_ref().map_err(Clone::clone)?,
+            &input,
+            &company,
+            &role,
+            &page.context,
+        )
+        .await?;
         let result = ProcessingResult {
             assessment,
             status: "awaiting_mesh".to_owned(),
+            company,
+            role,
             card_id: None,
         };
         write_json(&result_path, &result)?;
         result
     };
+    if result.company.is_empty() || result.role.is_empty() {
+        let page = fetch_job_page(&input.job_url).await.unwrap_or_default();
+        if result.company.is_empty() {
+            result.company = if input.company.is_empty() {
+                page.company
+            } else {
+                input.company.clone()
+            };
+        }
+        if result.role.is_empty() {
+            result.role = if input.role.is_empty() {
+                page.role
+            } else {
+                input.role.clone()
+            };
+        }
+        write_json(&result_path, &result)?;
+    }
     if matches!(result.status.as_str(), "chat_queued" | "card_created_v2") {
         return Ok(());
     }
     let Some(sender) = lead_sender else {
         return Ok(());
     };
-    let input: IncomingMessage =
-        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|_| "Invalid inbox message".to_owned())?;
     let body = lead_body(&input, id);
     let verdict = assessment_summary(&result.assessment);
-    let create_card = should_create_card(&input, &result.assessment);
+    let create_card = should_create_card(&input, &result);
     let (response, received) = oneshot::channel();
     sender
         .send(LeadRequest {
             lead_id: format!("item-{}", &id[..32]),
-            company: input.company,
-            role: input.role,
+            company: result.company.clone(),
+            role: result.role.clone(),
             job_url: input.job_url,
             body,
             verdict,
@@ -342,10 +389,10 @@ async fn process_one(
     write_json(&result_path, &result)
 }
 
-fn should_create_card(input: &IncomingMessage, assessment: &Assessment) -> bool {
-    assessment.choice == "yes"
-        && !input.company.trim().is_empty()
-        && !input.role.trim().is_empty()
+fn should_create_card(input: &IncomingMessage, result: &ProcessingResult) -> bool {
+    result.assessment.choice == "yes"
+        && !result.company.trim().is_empty()
+        && !result.role.trim().is_empty()
         && valid_job_url(&input.job_url)
 }
 
@@ -355,12 +402,241 @@ fn valid_job_url(value: &str) -> bool {
         && !value.contains(char::is_whitespace)
 }
 
+async fn fetch_job_page(value: &str) -> Result<JobPage, String> {
+    let mut url = Url::parse(value).map_err(|_| "Invalid job URL".to_owned())?;
+    for _ in 0..=3 {
+        let host = url
+            .host_str()
+            .ok_or_else(|| "Job URL has no host".to_owned())?
+            .to_owned();
+        if host.eq_ignore_ascii_case("localhost") {
+            return Err("Private job URL is not allowed".into());
+        }
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "Job URL has no usable port".to_owned())?;
+        let addresses = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| "Cannot resolve job URL".to_owned())?
+            .filter(|address| public_ip(address.ip()))
+            .collect::<Vec<_>>();
+        let address = addresses
+            .first()
+            .copied()
+            .ok_or_else(|| "Private job URL is not allowed".to_owned())?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(8))
+            .resolve(&host, address)
+            .build()
+            .map_err(|_| "Cannot create job page client".to_owned())?;
+        let mut response = client
+            .get(url.clone())
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (compatible; MeshLighthouse/1.0)",
+            )
+            .send()
+            .await
+            .map_err(|_| "Cannot fetch job page".to_owned())?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Job page redirect has no location".to_owned())?;
+            url = url
+                .join(location)
+                .map_err(|_| "Invalid job page redirect".to_owned())?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("Job page returned {}", response.status()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_JOB_PAGE_BYTES as u64)
+        {
+            return Err("Job page is too large".into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "Cannot read job page".to_owned())?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_JOB_PAGE_BYTES {
+                return Err("Job page is too large".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let html = String::from_utf8_lossy(&bytes);
+        return Ok(extract_job_page(&html, &url));
+    }
+    Err("Job page redirected too many times".into())
+}
+
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast())
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local())
+        }
+    }
+}
+
+fn extract_job_page(html: &str, url: &Url) -> JobPage {
+    let document = Html::parse_document(html);
+    let mut context = serde_json::Map::new();
+    let mut company = String::new();
+    let mut role = String::new();
+
+    if let Ok(selector) = Selector::parse("script[type='application/ld+json']") {
+        for script in document.select(&selector) {
+            let source = script.text().collect::<String>();
+            let Ok(value) = serde_json::from_str::<Value>(&source) else {
+                continue;
+            };
+            if let Some(job) = find_job_posting(&value) {
+                role = json_text(job.get("title")).unwrap_or_default();
+                company = job
+                    .get("hiringOrganization")
+                    .and_then(|organization| json_text(organization.get("name")))
+                    .unwrap_or_default();
+                for key in [
+                    "title",
+                    "description",
+                    "employmentType",
+                    "jobLocation",
+                    "applicantLocationRequirements",
+                    "datePosted",
+                    "validThrough",
+                ] {
+                    if let Some(value) = job.get(key).and_then(compact_job_value) {
+                        context.insert(key.to_owned(), value);
+                    }
+                }
+                if !company.is_empty() {
+                    context.insert("company".into(), Value::String(company.clone()));
+                }
+                break;
+            }
+        }
+    }
+
+    let meta = |property: &str| -> String {
+        let Ok(selector) = Selector::parse(&format!("meta[property='{property}']")) else {
+            return String::new();
+        };
+        document
+            .select(&selector)
+            .next()
+            .and_then(|element| element.value().attr("content"))
+            .map(clean_text)
+            .unwrap_or_default()
+    };
+    let og_title = meta("og:title");
+    let og_description = meta("og:description");
+    let site_name = meta("og:site_name");
+    let title = Selector::parse("title")
+        .ok()
+        .and_then(|selector| document.select(&selector).next())
+        .map(|element| clean_text(&element.text().collect::<String>()))
+        .unwrap_or_default();
+    if role.is_empty() {
+        role = if og_title.is_empty() {
+            title
+        } else {
+            og_title.clone()
+        };
+    }
+    if company.is_empty() {
+        company = if site_name.is_empty() {
+            url.host_str()
+                .unwrap_or_default()
+                .trim_start_matches("www.")
+                .to_owned()
+        } else {
+            site_name.clone()
+        };
+    }
+    if !og_title.is_empty() {
+        context.insert("openGraphTitle".into(), Value::String(og_title));
+    }
+    if !og_description.is_empty() {
+        context.insert("openGraphDescription".into(), Value::String(og_description));
+    }
+    if !site_name.is_empty() {
+        context.insert("siteName".into(), Value::String(site_name));
+    }
+    context.insert("resolvedUrl".into(), Value::String(url.to_string()));
+
+    JobPage {
+        company: bounded_text(&company, 256),
+        role: bounded_text(&role, 256),
+        context: Value::Object(context),
+    }
+}
+
+fn compact_job_value(value: &Value) -> Option<Value> {
+    if let Some(text) = value.as_str() {
+        let fragment = Html::parse_fragment(text);
+        let clean = clean_text(&fragment.root_element().text().collect::<String>());
+        return Some(Value::String(clean.chars().take(8_000).collect()));
+    }
+    (value.to_string().len() <= 8_000).then(|| value.clone())
+}
+
+fn find_job_posting(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    match value {
+        Value::Object(object) => {
+            let is_job = match object.get("@type") {
+                Some(Value::String(kind)) => kind == "JobPosting",
+                Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "JobPosting"),
+                _ => false,
+            };
+            if is_job {
+                return Some(object);
+            }
+            object.values().find_map(find_job_posting)
+        }
+        Value::Array(values) => values.iter().find_map(find_job_posting),
+        _ => None,
+    }
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(clean_text)
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    clean_text(value).chars().take(limit).collect()
+}
+
 fn lead_body(input: &IncomingMessage, id: &str) -> String {
-    let mut lines = vec![
-        input.job_url.clone(),
-        format!("Contact: {}", input.contact),
-        format!("Intake: {id}"),
-    ];
+    let mut lines = vec![input.job_url.clone(), format!("Intake: {id}")];
+    if !input.contact.is_empty() {
+        lines.insert(1, format!("Contact: {}", input.contact));
+    }
     if !input.message.is_empty() {
         lines.insert(1, input.message.clone());
     }
@@ -383,7 +659,13 @@ fn jev_client() -> Result<TypeSafeClient, String> {
         .map_err(|_| "Cannot initialize Jev client".to_owned())
 }
 
-async fn classify(client: &TypeSafeClient, input: &IncomingMessage) -> Result<Assessment, String> {
+async fn classify(
+    client: &TypeSafeClient,
+    input: &IncomingMessage,
+    company: &str,
+    role: &str,
+    page_context: &Value,
+) -> Result<Assessment, String> {
     let questions: BTreeMap<String, Question> = serde_json::from_value(json!({
         "job_opportunity": {
             "type": "choice",
@@ -423,7 +705,13 @@ async fn classify(client: &TypeSafeClient, input: &IncomingMessage) -> Result<As
     })).map_err(|_| "Invalid Jev question".to_owned())?;
     let response = client
         .system_one(
-            json!({"company": input.company, "role": input.role, "jobUrl": input.job_url, "message": input.message}),
+            json!({
+                "company": company,
+                "role": role,
+                "jobUrl": input.job_url,
+                "page": page_context,
+                "message": input.message
+            }),
             questions,
         )
         .await
@@ -703,6 +991,70 @@ mod tests {
     }
 
     #[test]
+    fn url_and_note_form_deserializes_without_identity_fields() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "Telegram: @recruiter",
+            "jobUrl": "https://example.com/jobs/123",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+
+        assert!(input.company.is_empty());
+        assert!(input.role.is_empty());
+        assert!(input.contact.is_empty());
+        assert_eq!(input.message, "Telegram: @recruiter");
+    }
+
+    #[test]
+    fn job_posting_metadata_enriches_the_classification_payload() {
+        let html = r#"
+            <html><head>
+              <meta property="og:title" content="Fallback title">
+              <script type="application/ld+json">
+                {
+                  "@context": "https://schema.org",
+                  "@type": "JobPosting",
+                  "title": "Senior Backend Engineer",
+                  "description": "Build distributed payment systems.",
+                  "employmentType": "FULL_TIME",
+                  "hiringOrganization": {"@type": "Organization", "name": "Pennylane"}
+                }
+              </script>
+            </head></html>
+        "#;
+
+        let page = extract_job_page(html, &Url::parse("https://jobs.example/42").unwrap());
+
+        assert_eq!(page.company, "Pennylane");
+        assert_eq!(page.role, "Senior Backend Engineer");
+        assert!(
+            page.context
+                .to_string()
+                .contains("distributed payment systems")
+        );
+        assert!(page.context.to_string().contains("FULL_TIME"));
+    }
+
+    #[test]
+    fn open_graph_is_used_when_job_posting_is_absent() {
+        let html = r#"
+            <html><head>
+              <title>Ignored fallback</title>
+              <meta property="og:title" content="Staff Platform Engineer">
+              <meta property="og:site_name" content="Acme">
+              <meta property="og:description" content="Own the developer platform.">
+            </head></html>
+        "#;
+
+        let page = extract_job_page(html, &Url::parse("https://jobs.example/42").unwrap());
+
+        assert_eq!(page.company, "Acme");
+        assert_eq!(page.role, "Staff Platform Engineer");
+        assert!(page.context.to_string().contains("developer platform"));
+    }
+
+    #[test]
     fn compact_form_cannot_create_an_untitled_board_card() {
         let input: IncomingMessage = serde_json::from_value(json!({
             "message": "This might be a relevant vacancy",
@@ -722,7 +1074,15 @@ mod tests {
             model: JEV_MODEL.into(),
         };
 
-        assert!(!should_create_card(&input, &assessment));
+        let result = ProcessingResult {
+            assessment,
+            status: "awaiting_mesh".into(),
+            company: "Pennylane".into(),
+            role: "Senior backend engineer".into(),
+            card_id: None,
+        };
+
+        assert!(!should_create_card(&input, &result));
     }
 
     #[test]
@@ -746,7 +1106,15 @@ mod tests {
             model: JEV_MODEL.into(),
         };
 
-        assert!(should_create_card(&input, &assessment));
+        let result = ProcessingResult {
+            assessment,
+            status: "awaiting_mesh".into(),
+            company: "Pennylane".into(),
+            role: "Senior backend engineer".into(),
+            card_id: None,
+        };
+
+        assert!(should_create_card(&input, &result));
     }
 
     #[test]
@@ -765,6 +1133,22 @@ mod tests {
         assert_eq!(
             lead_body(&input, "abc"),
             "https://example.com/jobs/123\n\nRemote in Germany\n\nContact: recruiter@example.com\n\nIntake: abc"
+        );
+    }
+
+    #[test]
+    fn lead_body_accepts_freeform_note_without_contact_field() {
+        let input: IncomingMessage = serde_json::from_value(json!({
+            "message": "Signal: recruiter.42",
+            "jobUrl": "https://example.com/jobs/123",
+            "humanCheckToken": "token",
+            "humanCheckAnswer": "4"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            lead_body(&input, "abc"),
+            "https://example.com/jobs/123\n\nSignal: recruiter.42\n\nIntake: abc"
         );
     }
 

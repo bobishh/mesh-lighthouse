@@ -2,10 +2,9 @@ FROM rust:1.98-bookworm AS build
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
 
 # Compile the stable dependency graph before copying Lighthouse sources. This
-# layer is reused until Cargo manifests or vendored MetaMesh code change.
+# layer is reused until Cargo manifests or pinned dependencies change.
 RUN mkdir src \
     && printf 'pub fn dependency_cache() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/main.rs \

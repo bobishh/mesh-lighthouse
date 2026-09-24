@@ -1,4 +1,0 @@
-[submodule "vendor/match"]
-	path = vendor/match
-	url = https://github.com/bobishh/match.git
-	branch = codex/rust-live-sync
