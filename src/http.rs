@@ -23,10 +23,11 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
-const MAX_PENDING: usize = 1_000;
+const MAX_PENDING: usize = 100;
+const MAX_CONCURRENT_INGEST: usize = 8;
 const CAPTCHA_TTL_SECONDS: u64 = 5 * 60;
 const JEV_MODEL: &str = "jev-1.13.0";
 const MAX_JOB_PAGE_BYTES: usize = 1_000_000;
@@ -48,6 +49,7 @@ pub type LeadSender = mpsc::Sender<LeadRequest>;
 struct AppState {
     inbox: Inbox,
     captcha: Captcha,
+    ingest_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -61,6 +63,12 @@ struct Inbox {
 struct Captcha {
     secret: Arc<[u8; 32]>,
     used: Arc<PathBuf>,
+}
+
+#[derive(Debug)]
+enum SaveInboxError {
+    Full,
+    Io(std::io::Error),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -167,6 +175,7 @@ pub async fn serve(
             secret: Arc::new(secret),
             used: Arc::new(captcha_used),
         },
+        ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
     };
     let processing_inbox = state.inbox.clone();
     tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
@@ -231,6 +240,16 @@ async fn ingest(
     {
         return Err((StatusCode::BAD_REQUEST, "Check the form fields"));
     }
+    let _ingest_slot = state
+        .ingest_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many messages are arriving. Try again shortly.",
+            )
+        })?;
     verify_captcha(
         &state.captcha,
         &input.human_check_token,
@@ -246,7 +265,16 @@ async fn ingest(
     let saved = tokio::task::spawn_blocking(move || save_inbox(&inbox, &id, &bytes).map(|_| id))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Inbox unavailable"))?
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Inbox unavailable"))?;
+        .map_err(|error| match error {
+            SaveInboxError::Full => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many messages are waiting. Try again later.",
+            ),
+            SaveInboxError::Io(error) => {
+                eprintln!("Lighthouse inbox write failed: {error}");
+                (StatusCode::SERVICE_UNAVAILABLE, "Inbox unavailable")
+            }
+        })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(
@@ -871,25 +899,35 @@ fn sign_captcha(captcha: &Captcha, payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn save_inbox(inbox: &Inbox, id: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn save_inbox(inbox: &Inbox, id: &str, bytes: &[u8]) -> Result<(), SaveInboxError> {
+    save_inbox_with_limit(inbox, id, bytes, MAX_PENDING)
+}
+
+fn save_inbox_with_limit(
+    inbox: &Inbox,
+    id: &str,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<(), SaveInboxError> {
     let _guard = inbox
         .write_lock
         .lock()
-        .map_err(|_| std::io::Error::other("Inbox lock unavailable"))?;
+        .map_err(|_| SaveInboxError::Io(std::io::Error::other("Inbox lock unavailable")))?;
     let directory = &inbox.directory;
     let path = directory.join(format!("{id}.json"));
     if path.exists() {
         return Ok(());
     }
-    if fs::read_dir(directory.as_ref())?
+    if fs::read_dir(directory.as_ref())
+        .map_err(SaveInboxError::Io)?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .count()
-        >= MAX_PENDING
+        >= limit
     {
-        return Err(std::io::Error::other("Inbox is full"));
+        return Err(SaveInboxError::Full);
     }
-    atomic_write(directory, &path, bytes)
+    atomic_write(directory, &path, bytes).map_err(SaveInboxError::Io)
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1175,6 +1213,24 @@ mod tests {
 
         assert!(!path.exists());
         remove_inbox(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_active_inbox_rejects_new_work_without_hiding_it_as_io_failure() {
+        let root =
+            std::env::temp_dir().join(format!("lighthouse-inbox-limit-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let inbox = Inbox {
+            directory: Arc::new(root.clone()),
+            results: Arc::new(root.join("results")),
+            write_lock: Arc::new(Mutex::new(())),
+        };
+        save_inbox_with_limit(&inbox, "first", b"{}", 1).unwrap();
+
+        let result = save_inbox_with_limit(&inbox, "second", b"{}", 1);
+
+        assert!(matches!(result, Err(SaveInboxError::Full)));
         let _ = fs::remove_dir_all(root);
     }
 
