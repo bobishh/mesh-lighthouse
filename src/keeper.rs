@@ -365,6 +365,11 @@ fn relocate_provisioned_scope_dirs(
     if !scopes_root.exists() {
         join::create_private_directory(&scopes_root).map_err(|error| error.to_string())?;
     }
+    // Persist the scopes entry before the registry can durably reference it.
+    // Repeat on retry: a prior attempt may have created it before sync failed.
+    fs::File::open(service_directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
     let mut moved = Vec::new();
     for scope in staged {
         let staging = scope
