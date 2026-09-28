@@ -11,17 +11,18 @@ use iroh::{EndpointAddr, EndpointId};
 use match_lighthouse::{MatchLighthouseState, MatchScopeStore, now_ms};
 use meta_mesh_core::{
     DEFAULT_SIGNATURE_DOMAIN, DeviceCertificate, DeviceCertificatePayload, MeshHandshake,
-    PublicIdentity, ScopedInvitation, VerifyWorkspaceMemberOptions, WorkspaceGrant,
-    WorkspaceJoinHandshake, WorkspaceJoinResponse, WorkspaceRole, decode_workspace_set,
+    MeshScopeFrameEffect, MeshScopeRuntime, PublicIdentity, ScopedInvitation,
+    VerifyWorkspaceMemberOptions, WorkspaceGrant, WorkspaceJoinHandshake, WorkspaceJoinInvitation,
+    WorkspaceJoinResponse, WorkspaceRole, decode_workspace_set, encode_workspace_set,
     parse_invitation, public_key_from_seed, public_key_id, sign_device_certificate,
     sign_json_envelope, verify_workspace_grant, verify_workspace_member_bundle,
 };
-use meta_mesh_native::{NativeNode, NativeNodeOptions, NativeScopeHost};
+use meta_mesh_native::{NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeHost};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, macros::format_description};
 
-use crate::Config;
+use crate::{Config, ProvisioningCommit};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -168,6 +169,292 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
         directory.join("config.json").display(),
     );
     Ok(())
+}
+
+/// Join approved owner scopes with the already running Lighthouse identity.
+/// The activation callback must atomically publish all staged configs before
+/// the handshake ACK is sent to Match.
+pub async fn provision_existing_identity(
+    invite: WorkspaceJoinInvitation,
+    approved_scopes: &[String],
+    pairing_id: &str,
+    operation_id: &str,
+    transcript_hash: &str,
+    base: &Config,
+    node: &NativeNode,
+    service_directory: &Path,
+    activate: impl FnOnce(Vec<Config>, ProvisioningCommit) -> Result<(), String>,
+) -> Result<Vec<String>, BoxError> {
+    let scope_ids = invite
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<Vec<_>>();
+    if scope_ids.is_empty() || scope_ids != approved_scopes {
+        return Err("Invitation scope set differs from dual-approved scopes".into());
+    }
+    if invite.role != "visitor" {
+        return Err("Keeper replication requires visitor grants".into());
+    }
+    let identity_seed: [u8; 32] = base
+        .identity_seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Keeper identity seed must contain 32 bytes")?;
+    let device_seed: [u8; 32] = base
+        .device_seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Keeper device seed must contain 32 bytes")?;
+    let iroh_secret: [u8; 32] = base
+        .iroh_secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Keeper Iroh seed must contain 32 bytes")?;
+    let identity_public_key = public_key_from_seed(&identity_seed)?;
+    let person_id = public_key_id(&identity_public_key)?;
+    let device_id = public_key_id(&public_key_from_seed(&device_seed)?)?;
+    if person_id
+        != base
+            .local_handshake
+            .peer
+            .pointer("/advertisement/payload/personId")
+            .and_then(Value::as_str)
+            .ok_or("Missing configured Lighthouse person identity")?
+        || device_id != base.device_id
+        || invite.issuer_person_id.is_empty()
+    {
+        return Err(
+            "Configured Lighthouse identity material does not match its certificate".into(),
+        );
+    }
+    let device_certificate = base
+        .local_handshake
+        .peer
+        .get("certificates")
+        .and_then(Value::as_array)
+        .and_then(|certificates| certificates.first())
+        .cloned()
+        .ok_or("Missing configured Lighthouse device certificate")?;
+    let device_certificate: DeviceCertificate = serde_json::from_value(device_certificate)?;
+    let endpoint = base
+        .local_handshake
+        .peer
+        .pointer("/advertisement/payload/endpoint")
+        .and_then(Value::as_str)
+        .ok_or("Missing configured Lighthouse endpoint")?;
+    let bundles = invite
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            guest_bundle(
+                &workspace.id,
+                &person_id,
+                &device_id,
+                &identity_public_key,
+                &device_certificate,
+                &device_seed,
+                endpoint,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner_endpoint = EndpointId::from_str(&invite.issuer_endpoint)?;
+    let session = node
+        .connect_browser(EndpointAddr::new(owner_endpoint), Duration::from_secs(15))
+        .await?;
+    if pairing_id.is_empty()
+        || !pairing_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        session.close();
+        return Err("Invalid pairing identifier".into());
+    }
+    let stage_root = service_directory.join(format!(".provisioning-{pairing_id}"));
+    if stage_root.exists() {
+        fs::remove_dir_all(&stage_root)?;
+    }
+    create_private_directory(&stage_root)?;
+    let mut committed = false;
+    let result = async {
+        let mut machine = WorkspaceJoinHandshake::guest(&invite.secret)?;
+        let request = serde_json::to_vec(&json!({
+            "invitationId": invite.invitation_id,
+            "personId": person_id,
+            "displayName": "mesh-lighthouse",
+            "meshPeers": bundles,
+            "followOwner": false,
+        }))?;
+        let frame = machine.send_request(&request)?;
+        let response = session.exchange(&frame, Duration::from_secs(600)).await?;
+        let accepted = match machine.receive_response(&response)? {
+            WorkspaceJoinResponse::Accepted(payload) => payload,
+            WorkspaceJoinResponse::Rejected(reason) => {
+                let ack = machine.acknowledge_rejection()?;
+                let _ = session.exchange(&ack, Duration::from_secs(10)).await;
+                return Err::<Vec<String>, BoxError>(reason.into());
+            }
+        };
+        let mut received: JoinResponse = serde_json::from_slice(&accepted)?;
+        if received.grants.len() != scope_ids.len()
+            || received.mesh_workspaces.len() != scope_ids.len()
+        {
+            return Err("Workspace invitation must contain every selected grant and scope".into());
+        }
+        let snapshot_bytes = URL_SAFE_NO_PAD.decode(&received.snapshot)?;
+        let mut entries = decode_workspace_set(&snapshot_bytes, &scope_ids)?;
+        let proof_cache = stage_root.join("proof-pages");
+        create_private_directory(&proof_cache)?;
+        for entry in &mut entries {
+            let authorization = entry
+                .authorization
+                .as_ref()
+                .ok_or("Invitation scope is missing authorization evidence")?;
+            if authorization.get("kind").and_then(Value::as_str)
+                != Some("workspace-authorization-manifest")
+            {
+                continue;
+            }
+            let candidate = URL_SAFE_NO_PAD.decode(&entry.bytes)?;
+            entry.authorization = Some(
+                resolve_initial_authorization(
+                    &entry.id,
+                    &invite.secret,
+                    &candidate,
+                    authorization,
+                    &proof_cache,
+                    &session,
+                )
+                .await?,
+            );
+        }
+        let snapshot = encode_workspace_set(&entries)?;
+        received.snapshot = URL_SAFE_NO_PAD.encode(&snapshot);
+        let mut staged = Vec::with_capacity(scope_ids.len());
+        for (index, workspace) in invite.workspaces.iter().enumerate() {
+            let mut scoped_invite = invite.clone();
+            scoped_invite.workspace_id = workspace.id.clone();
+            scoped_invite.workspaces = vec![workspace.clone()];
+            let grant = received
+                .grants
+                .iter()
+                .find(|grant| grant.payload.workspace_id == workspace.id)
+                .ok_or("Missing invited scope grant")?;
+            let envelope = received
+                .mesh_workspaces
+                .iter()
+                .find(|envelope| envelope["workspaceId"] == workspace.id)
+                .ok_or("Missing invited scope")?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == workspace.id)
+                .ok_or("Missing invited document")?;
+            let scoped_snapshot = encode_workspace_set(std::slice::from_ref(entry))?;
+            let scoped_response = serde_json::to_vec(&json!({
+                "grants": [grant],
+                "meshWorkspaces": [envelope],
+                "snapshot": URL_SAFE_NO_PAD.encode(scoped_snapshot),
+            }))?;
+            let stage_directory = stage_root.join(format!("scope-{index}"));
+            create_private_directory(&stage_directory)?;
+            let mut scope = prepare_config(
+                &scoped_invite,
+                &scoped_response,
+                &stage_directory,
+                &person_id,
+                &device_id,
+                &bundles[index],
+                identity_seed,
+                &device_seed,
+                iroh_secret,
+            )?;
+            scope.controller_person_id = Some(invite.issuer_person_id.clone());
+            staged.push(scope);
+        }
+        let commit = ProvisioningCommit {
+            pairing_id: pairing_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            transcript_hash: transcript_hash.to_owned(),
+            invitation_id: invite.invitation_id.clone(),
+            workspace_ids: scope_ids.clone(),
+        };
+        if let Err(error) = activate(staged, commit) {
+            return Err(error.into());
+        }
+        committed = true;
+        fs::remove_dir_all(&proof_cache)?;
+        let ack = machine.acknowledge_success(&snapshot)?;
+        session.exchange(&ack, Duration::from_secs(20)).await?;
+        Ok(scope_ids.clone())
+    }
+    .await;
+    session.close();
+    if result.is_err() && !committed {
+        let _ = fs::remove_dir_all(&stage_root);
+    }
+    result
+}
+
+async fn resolve_initial_authorization(
+    workspace_id: &str,
+    secret: &str,
+    candidate: &[u8],
+    manifest: &Value,
+    cache_directory: &Path,
+    session: &NativeBrowserConnection,
+) -> Result<Value, BoxError> {
+    let mut runtime = MeshScopeRuntime::new(workspace_id, secret)?;
+    let empty_document = automerge::AutoCommit::new().save();
+    let mut effect =
+        runtime.begin_authorization_transfer(candidate, &empty_document, manifest.clone())?;
+    for _ in 0..4096 {
+        effect = match effect {
+            MeshScopeFrameEffect::ProofRequest { frame, cache_key } => {
+                let safe_key = cache_key
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() {
+                            character
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>();
+                let path = cache_directory.join(format!("{safe_key}.page"));
+                let reply = match fs::read(&path) {
+                    Ok(cached) => runtime.accept_proof_page(&cached)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let response = session.exchange(&frame, Duration::from_secs(20)).await?;
+                        runtime
+                            .receive_frame(&response)?
+                            .ok_or("Lighthouse proof response was empty")?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                reply
+            }
+            MeshScopeFrameEffect::ProofPageReceived { cache_key, payload } => {
+                let safe_key = cache_key
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() {
+                            character
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>();
+                write_private_file(&cache_directory.join(format!("{safe_key}.page")), &payload)?;
+                runtime.continue_proof_receive()?
+            }
+            MeshScopeFrameEffect::DocumentReceive {
+                proof: Some(bundle),
+                ..
+            } => return Ok(bundle),
+            _ => return Err("Lighthouse returned an invalid authorization-page sequence".into()),
+        };
+    }
+    Err("Lighthouse authorization history exceeded 4096 pages".into())
 }
 
 pub(crate) fn guest_bundle(
@@ -367,6 +654,7 @@ pub(crate) fn prepare_config(
         device_seed: device_seed.to_vec(),
         additional_scopes: Vec::new(),
         controller_person_id: None,
+        provisioning_commits: Vec::new(),
     })
 }
 
@@ -409,6 +697,21 @@ fn cleanup_failed_join(directory: &PathBuf, directory_existed: bool) {
     if !directory_existed {
         let _ = fs::remove_dir(directory);
     }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BoxError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::File::open(path.parent().ok_or("Invalid proof cache path")?)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

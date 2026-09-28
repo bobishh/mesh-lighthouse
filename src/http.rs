@@ -29,8 +29,10 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
 use crate::pairing::{
-    ControllerRequest, LoginRequest, PairingError, PairingService, SessionResponse,
+    ControllerRequest, LoginRequest, PairingError, PairingService, ProvisionedScope,
+    SessionResponse,
 };
+use crate::provisioning::ProvisioningService;
 
 const MAX_PENDING: usize = 100;
 const MAX_CONCURRENT_INGEST: usize = 8;
@@ -58,6 +60,7 @@ struct AppState {
     ingest_slots: Arc<Semaphore>,
     discovery: Option<Discovery>,
     pairings: Option<PairingService>,
+    provisioner: Option<Arc<ProvisioningService>>,
     cors_origins: Arc<Vec<String>>,
 }
 
@@ -65,6 +68,7 @@ struct AppState {
 pub struct Discovery {
     descriptor: Value,
     pairings: Option<PairingService>,
+    provisioner: Option<Arc<ProvisioningService>>,
 }
 
 impl Discovery {
@@ -123,12 +127,21 @@ impl Discovery {
                 "managementPath": "/admin"
             }),
             pairings: None,
+            provisioner: None,
         })
     }
 
     pub fn with_pairings(mut self, pairings: PairingService) -> Self {
         self.descriptor["capabilities"]["pairing"] = Value::Bool(true);
         self.pairings = Some(pairings);
+        self
+    }
+
+    pub fn with_provisioner(mut self, provisioner: ProvisioningService) -> Self {
+        if self.pairings.is_some() {
+            self.descriptor["capabilities"]["provisioning"] = Value::Bool(true);
+        }
+        self.provisioner = Some(Arc::new(provisioner));
         self
     }
 }
@@ -254,15 +267,21 @@ pub async fn serve(
         .filter(|origin| !origin.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let mut allowed_origins = vec![
-        "https://meta-uber-engineer.dev".parse::<HeaderValue>()?,
-        "http://127.0.0.1:18181".parse::<HeaderValue>()?,
-        "http://localhost:18181".parse::<HeaderValue>()?,
-    ];
+    let mut allowed_origins = Vec::with_capacity(cors_origins.len());
     for origin in &cors_origins {
+        let parsed = Url::parse(origin)?;
+        let loopback = parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
+        if parsed.origin().ascii_serialization() != *origin
+            || (parsed.scheme() != "https" && !(loopback && parsed.scheme() == "http"))
+        {
+            return Err(format!("Invalid configured Lighthouse CORS origin: {origin}").into());
+        }
         allowed_origins.push(origin.parse::<HeaderValue>()?);
     }
     let pairings = discovery.as_ref().and_then(|item| item.pairings.clone());
+    let provisioner = discovery.as_ref().and_then(|item| item.provisioner.clone());
     let state = AppState {
         inbox: Inbox {
             directory: Arc::new(inbox),
@@ -276,6 +295,7 @@ pub async fn serve(
         ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
         discovery,
         pairings,
+        provisioner,
         cors_origins: Arc::new(cors_origins),
     };
     let processing_inbox = state.inbox.clone();
@@ -294,6 +314,7 @@ fn http_app(state: AppState, allowed_origins: Vec<HeaderValue>) -> Router {
         .route("/v1/pairings", post(create_pairing))
         .route("/v1/pairings/{id}/decision", post(pairing_decision))
         .route("/v1/pairings/{id}/status", post(pairing_status))
+        .route("/v1/pairings/{id}/provision", post(pairing_provision))
         .route("/admin", get(admin_page))
         .route("/admin/", get(admin_page))
         .route("/admin/api/session", post(admin_login))
@@ -364,6 +385,67 @@ async fn pairing_status(
         )
         .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
     ))
+}
+
+async fn pairing_provision(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let provision = pairings
+        .begin_provision(&id, request)
+        .map_err(PairingResponseError)?;
+    if provision.should_run {
+        let scope_results = if let Some(provisioner) = &state.provisioner {
+            match provisioner
+                .provision(
+                    &id,
+                    &provision.operation_id,
+                    &provision.transcript_hash,
+                    provision.invitation,
+                    provision.scopes.clone(),
+                )
+                .await
+            {
+                Ok(scopes) => scopes,
+                Err(_) => provision
+                    .scopes
+                    .iter()
+                    .map(|workspace_id| ProvisionedScope {
+                        workspace_id: workspace_id.clone(),
+                        status: "pending".into(),
+                        error: Some("join_failed".into()),
+                    })
+                    .collect(),
+            }
+        } else {
+            provision
+                .scopes
+                .iter()
+                .map(|workspace_id| ProvisionedScope {
+                    workspace_id: workspace_id.clone(),
+                    status: "pending".into(),
+                    error: Some("runtime_unavailable".into()),
+                })
+                .collect()
+        };
+        let active = scope_results
+            .iter()
+            .all(|scope| scope.status == "active" && scope.error.is_none());
+        pairings
+            .complete_provision(&id, scope_results, active)
+            .map_err(PairingResponseError)?;
+    }
+    let status = pairings
+        .signed_provision_status(&id)
+        .map_err(PairingResponseError)?;
+    Ok(Json(serde_json::to_value(status).map_err(|_| {
+        PairingResponseError(PairingError::Unavailable)
+    })?))
 }
 
 async fn admin_login(
@@ -1433,6 +1515,7 @@ mod tests {
             ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
             discovery: Some(discovery),
             pairings: Some(pairing_service.clone()),
+            provisioner: None,
             cors_origins: Arc::new(vec![]),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1545,6 +1628,24 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
+        let state_directory = root.join("pairing-state");
+        let displaced_directory = root.join("pairing-state-saved");
+        fs::rename(&state_directory, &displaced_directory).unwrap();
+        fs::write(&state_directory, b"blocked").unwrap();
+        let failed_operator_write = client
+            .post(&decision_url)
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", login_body["csrfToken"].as_str().unwrap())
+            .json(&json!({"decision":"approve"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            failed_operator_write.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        fs::remove_file(&state_directory).unwrap();
+        fs::rename(&displaced_directory, &state_directory).unwrap();
         let operator_approval = client
             .post(&decision_url)
             .header(header::COOKIE, &cookie)
@@ -1558,6 +1659,40 @@ mod tests {
             operator_approval.json::<Value>().await.unwrap()["status"]["status"],
             "pending"
         );
+
+        // A single approval cannot consume an invitation, even with a signed
+        // provisioning request that names the exact pairing and service.
+        let mut provision = common_payload(
+            "lighthouse-pairing-provision",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            origin,
+            "provision-0123456789abcdef",
+        );
+        provision["pairingId"] = json!(pairing_id);
+        provision["transcriptHash"] = json!(transcript_hash);
+        provision["body"] = json!({
+            "pairingId": pairing_id,
+            "transcriptHash": transcript_hash,
+            "servicePersonId": service_identity.person_id,
+            "approvedScopes": [{"workspaceId":"disposable-board","mode":"replicate"}],
+            "invitation": {}
+        });
+        let provision = request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certificates,
+            provision,
+        );
+        let denied = client
+            .post(format!("{test_origin}/v1/pairings/{pairing_id}/provision"))
+            .json(&provision)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
         let mut decision = common_payload(
             "lighthouse-pairing-decision",
@@ -1578,6 +1713,20 @@ mod tests {
             &controller_certificates,
             decision,
         );
+        fs::rename(&state_directory, &displaced_directory).unwrap();
+        fs::write(&state_directory, b"blocked").unwrap();
+        let failed_controller_write = client
+            .post(format!("{test_origin}/v1/pairings/{pairing_id}/decision"))
+            .json(&signed_decision)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            failed_controller_write.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        fs::remove_file(&state_directory).unwrap();
+        fs::rename(&displaced_directory, &state_directory).unwrap();
         let response = client
             .post(format!("{test_origin}/v1/pairings/{pairing_id}/decision"))
             .json(&signed_decision)
@@ -1672,6 +1821,7 @@ mod tests {
             ingest_slots: Arc::new(Semaphore::new(1)),
             discovery: Some(Discovery::from_peer(&peer, "https://keeper.example").unwrap()),
             pairings: None,
+            provisioner: None,
             cors_origins: Arc::new(vec!["https://match.example".into()]),
         };
         let allowed_origin = "https://match.example".parse::<HeaderValue>().unwrap();

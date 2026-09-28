@@ -14,7 +14,7 @@ use meta_mesh_native::{NativeScopeHost, NativeScopeServiceHost};
 use serde_json::{Value, json};
 
 use super::KeeperHost;
-use crate::{Config, join};
+use crate::{Config, ProvisioningCommit, join};
 
 struct Identity {
     identity_seed: [u8; 32],
@@ -298,6 +298,25 @@ impl TestKeeper {
         let mut scope = host.open_scope(&peer)?;
         scope.merge_owner_offer(offer.to_string().as_bytes())
     }
+
+    fn staged_scope(&self, workspace_id: &str) -> Config {
+        let fixture = fixture(&self.owner, &self.keeper, workspace_id);
+        let directory = self.directory.join(format!(".provisioning-{workspace_id}"));
+        let mut config = join::prepare_config(
+            &fixture.invitation,
+            &fixture.response,
+            &directory,
+            &self.keeper.person_id,
+            &self.keeper.device_id,
+            &self.keeper.bundle(workspace_id),
+            self.keeper.identity_seed,
+            &self.keeper.device_seed,
+            self.keeper.endpoint_secret,
+        )
+        .unwrap();
+        config.controller_person_id = Some(self.owner.person_id.clone());
+        config
+    }
 }
 
 impl Drop for TestKeeper {
@@ -460,6 +479,85 @@ fn registry_write_failure_does_not_activate_or_leave_new_scope_storage() {
             .to_string_lossy()
             .starts_with("scope-")
     }));
+}
+
+#[test]
+fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
+    let keeper = TestKeeper::new();
+    let staged = vec![
+        keeper.staged_scope("selected-board-a"),
+        keeper.staged_scope("selected-board-b"),
+    ];
+    let commit = ProvisioningCommit {
+        pairing_id: "pairing-test".into(),
+        operation_id: "operation-test".into(),
+        transcript_hash: "transcript-test".into(),
+        invitation_id: "invitation-test".into(),
+        workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
+    };
+
+    keeper
+        .host
+        .activate_provisioned_scopes(staged.clone(), commit.clone())
+        .unwrap();
+    assert_eq!(
+        keeper
+            .host
+            .scopes()
+            .unwrap()
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "primary-board".to_string(),
+            "selected-board-a".to_string(),
+            "selected-board-b".to_string()
+        ]
+    );
+    keeper
+        .host
+        .activate_provisioned_scopes(staged, commit.clone())
+        .unwrap();
+    assert!(keeper.host.configuration().unwrap().provisioning_commits == vec![commit]);
+}
+
+#[test]
+fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
+    let keeper = TestKeeper::new();
+    let first = keeper.staged_scope("selected-board-a");
+    let mut second = keeper.staged_scope("selected-board-b");
+    second.controller_person_id = Some("wrong-controller".into());
+    let commit = ProvisioningCommit {
+        pairing_id: "pairing-test".into(),
+        operation_id: "operation-test".into(),
+        transcript_hash: "transcript-test".into(),
+        invitation_id: "invitation-test".into(),
+        workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
+    };
+
+    assert!(
+        keeper
+            .host
+            .activate_provisioned_scopes(vec![first, second], commit)
+            .is_err()
+    );
+    assert_eq!(keeper.host.scopes().unwrap().len(), 1);
+    assert!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .additional_scopes
+            .is_empty()
+    );
+    assert!(
+        keeper
+            .host
+            .configuration()
+            .unwrap()
+            .provisioning_commits
+            .is_empty()
+    );
 }
 
 #[test]

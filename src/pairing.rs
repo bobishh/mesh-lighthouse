@@ -8,9 +8,10 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use meta_mesh_core::{
-    DeviceCertificate, PublicIdentity, SignedEnvelope, canonicalize_json, public_key_id,
-    sign_json_envelope, verify_device_certificate_chain, verify_signed_envelope,
+    DeviceCertificate, PublicIdentity, SignedEnvelope, WorkspaceJoinInvitation, canonicalize_json,
+    public_key_id, sign_json_envelope, verify_device_certificate_chain, verify_signed_envelope,
 };
+use meta_mesh_native::FileScopeStore;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,9 +30,10 @@ pub struct PairingService {
     service_seed: Arc<[u8; 32]>,
     origin: String,
     admin_secret: Arc<String>,
+    provisioning_runs: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PairingState {
     records: HashMap<String, PairingRecord>,
     #[serde(skip)]
@@ -56,6 +58,34 @@ pub struct PairingRecord {
     pub offer: Value,
     pub challenge: SignedEnvelope<Value>,
     pub last_operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ProvisioningRecord>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisioningRecord {
+    pub operation_id: String,
+    pub request_hash: String,
+    pub status: String,
+    pub scopes: Vec<ProvisionedScope>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionedScope {
+    pub workspace_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub struct ProvisionRequest {
+    pub invitation: WorkspaceJoinInvitation,
+    pub scopes: Vec<String>,
+    pub operation_id: String,
+    pub transcript_hash: String,
+    pub should_run: bool,
 }
 
 #[derive(Clone)]
@@ -149,6 +179,7 @@ impl PairingService {
             service_seed: Arc::new(service_seed),
             origin,
             admin_secret: Arc::new(admin_secret),
+            provisioning_runs: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -278,9 +309,12 @@ impl PairingService {
             offer: payload.clone(),
             challenge,
             last_operation_id: operation_id.to_owned(),
+            provisioning: None,
         };
-        state.records.insert(record.id.clone(), record.clone());
-        self.persist(&state)?;
+        let mut next = state.clone();
+        next.records.insert(record.id.clone(), record.clone());
+        self.persist(&next)?;
+        *state = next;
         Ok(record)
     }
 
@@ -292,8 +326,14 @@ impl PairingService {
         let _ = self.verify_controller(&request)?;
         let now = now_seconds();
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
-        let record = state.records.get_mut(id).ok_or(PairingError::NotFound)?;
-        if record.expires_at <= now {
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        if record.expires_at <= now
+            && record
+                .provisioning
+                .as_ref()
+                .map(|provisioning| provisioning.status.as_str())
+                != Some("active")
+        {
             return Err(PairingError::Expired);
         }
         if request.identity.person_id != record.controller.person_id
@@ -346,6 +386,8 @@ impl PairingService {
         {
             return Err(PairingError::Conflict);
         }
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
         record.controller_approved = Some(approved);
         record.controller_decision_operation = Some(operation_id.to_owned());
         record.controller_decision_hash = Some(decision_hash);
@@ -353,8 +395,230 @@ impl PairingService {
             record.operator_approved = Some(false);
         }
         let result = record.clone();
-        self.persist(&state)?;
+        self.persist(&next)?;
+        *state = next;
         Ok(result)
+    }
+
+    /// Admit only an ordinary workspace invitation for the exact dual-approved
+    /// service identity and scope set. The invitation secret stays out of every
+    /// durable pairing record and status response.
+    pub fn begin_provision(
+        &self,
+        id: &str,
+        request: ControllerRequest,
+    ) -> Result<ProvisionRequest, PairingError> {
+        let device_key = self.verify_controller(&request)?;
+        let now = now_seconds();
+        let payload = &request.signed.payload;
+        validate_common(
+            payload,
+            "lighthouse-pairing-provision",
+            &request,
+            &self.service_identity,
+            &self.origin,
+            now,
+        )?;
+        let operation_id = string_field(payload, "operationId")?.to_owned();
+        let body = payload
+            .get("body")
+            .and_then(Value::as_object)
+            .ok_or(PairingError::Invalid("Missing provisioning body"))?;
+        if body.get("pairingId").and_then(Value::as_str) != Some(id)
+            || body.get("transcriptHash").and_then(Value::as_str).is_none()
+            || body.get("servicePersonId").and_then(Value::as_str)
+                != Some(self.service_identity.person_id.as_str())
+        {
+            return Err(PairingError::Invalid(
+                "Provision request is not bound to this service and pairing",
+            ));
+        }
+        let approved = body
+            .get("approvedScopes")
+            .and_then(Value::as_array)
+            .ok_or(PairingError::Invalid("Missing approved scope list"))?;
+        let request_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            canonicalize_json(payload)
+                .map_err(|_| PairingError::Invalid("Invalid provisioning request"))?
+                .as_bytes(),
+        ));
+
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        if record.expires_at <= now {
+            return Err(PairingError::Expired);
+        }
+        if request.identity.person_id != record.controller.person_id
+            || request.device_id != record.controller_device_id
+            || body.get("transcriptHash").and_then(Value::as_str)
+                != Some(record.transcript_hash.as_str())
+        {
+            return Err(PairingError::Forbidden);
+        }
+        if record.controller_approved != Some(true) || record.operator_approved != Some(true) {
+            return Err(PairingError::Forbidden);
+        }
+        let transcript_hash = record.transcript_hash.clone();
+        let invitation: WorkspaceJoinInvitation = serde_json::from_value(
+            body.get("invitation")
+                .cloned()
+                .ok_or(PairingError::Invalid("Missing workspace invitation"))?,
+        )
+        .map_err(|_| PairingError::Invalid("Invalid workspace invitation"))?;
+        let offered = record.offer["body"]["scopes"]
+            .as_array()
+            .ok_or(PairingError::Invalid("Pairing has no approved scopes"))?;
+        let mut scope_ids = Vec::with_capacity(offered.len());
+        for (index, scope) in offered.iter().enumerate() {
+            let workspace_id = scope["workspaceId"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or(PairingError::Invalid("Invalid approved scope"))?;
+            if scope["mode"] != "replicate"
+                || approved.get(index).is_none_or(|entry| {
+                    entry["workspaceId"] != workspace_id || entry["mode"] != "replicate"
+                })
+            {
+                return Err(PairingError::Invalid(
+                    "Provision scopes differ from the approved transcript",
+                ));
+            }
+            scope_ids.push(workspace_id.to_owned());
+        }
+        if approved.len() != scope_ids.len()
+            || invitation.kind != "workspace-join"
+            || invitation.version != 1
+            || invitation.issuer_person_id != request.identity.person_id
+            || invitation.issuer_device_id != request.device_id
+            || invitation.issuer_public_key != device_key
+            || invitation.role != "visitor"
+            || invitation.secret.len() < 32
+            || invitation
+                .workspaces
+                .iter()
+                .map(|scope| scope.id.clone())
+                .collect::<Vec<_>>()
+                != scope_ids
+            || invitation.workspace_id != scope_ids.first().cloned().unwrap_or_default()
+            || invitation.invitation_id.is_empty()
+            || invitation.issuer_endpoint.is_empty()
+            || invitation.expires_at.is_empty()
+        {
+            return Err(PairingError::Invalid(
+                "Invitation does not match the approved owner and scopes",
+            ));
+        }
+        let created_at = time::OffsetDateTime::parse(
+            &invitation.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| PairingError::Invalid("Invalid invitation creation time"))?;
+        let expires_at = time::OffsetDateTime::parse(
+            &invitation.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| PairingError::Invalid("Invalid invitation expiry"))?;
+        let now = time::OffsetDateTime::now_utc();
+        if created_at > now + time::Duration::seconds(30)
+            || expires_at <= now
+            || expires_at <= created_at
+            || expires_at - created_at > time::Duration::minutes(10)
+        {
+            return Err(PairingError::Invalid(
+                "Invitation must be valid and expire within 10 minutes",
+            ));
+        }
+        if let Some(previous) = &record.provisioning {
+            if previous.operation_id != operation_id || previous.request_hash != request_hash {
+                return Err(PairingError::Conflict);
+            }
+            if previous.status == "active" {
+                return Ok(ProvisionRequest {
+                    invitation,
+                    scopes: scope_ids,
+                    operation_id,
+                    transcript_hash,
+                    should_run: false,
+                });
+            }
+        } else {
+            let mut next = state.clone();
+            next.records
+                .get_mut(id)
+                .ok_or(PairingError::NotFound)?
+                .provisioning = Some(ProvisioningRecord {
+                operation_id: operation_id.clone(),
+                request_hash: request_hash.clone(),
+                status: "provisioning".into(),
+                scopes: scope_ids
+                    .iter()
+                    .map(|workspace_id| ProvisionedScope {
+                        workspace_id: workspace_id.clone(),
+                        status: "pending".into(),
+                        error: None,
+                    })
+                    .collect(),
+            });
+            self.persist(&next)?;
+            *state = next;
+        }
+        drop(state);
+        let mut running = self
+            .provisioning_runs
+            .lock()
+            .map_err(|_| PairingError::Unavailable)?;
+        let should_run = running.insert(id.to_owned());
+        Ok(ProvisionRequest {
+            invitation,
+            scopes: scope_ids,
+            operation_id,
+            transcript_hash,
+            should_run,
+        })
+    }
+
+    pub fn complete_provision(
+        &self,
+        id: &str,
+        scopes: Vec<ProvisionedScope>,
+        active: bool,
+    ) -> Result<(), PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let provisioning = next
+            .records
+            .get_mut(id)
+            .ok_or(PairingError::NotFound)?
+            .provisioning
+            .as_mut()
+            .ok_or(PairingError::Conflict)?;
+        if scopes.len() != provisioning.scopes.len()
+            || scopes
+                .iter()
+                .zip(&provisioning.scopes)
+                .any(|(actual, expected)| actual.workspace_id != expected.workspace_id)
+            || (active
+                && scopes
+                    .iter()
+                    .any(|scope| scope.status != "active" || scope.error.is_some()))
+        {
+            return Err(PairingError::Conflict);
+        }
+        provisioning.scopes = scopes;
+        provisioning.status = if active { "active" } else { "provisioning" }.into();
+        if let Err(error) = self.persist(&next) {
+            self.provisioning_runs
+                .lock()
+                .map_err(|_| PairingError::Unavailable)?
+                .remove(id);
+            return Err(error);
+        }
+        *state = next;
+        self.provisioning_runs
+            .lock()
+            .map_err(|_| PairingError::Unavailable)?
+            .remove(id);
+        Ok(())
     }
 
     pub fn status(
@@ -364,10 +628,9 @@ impl PairingService {
     ) -> Result<SignedEnvelope<Value>, PairingError> {
         let _ = self.verify_controller(&request)?;
         let now = now_seconds();
-        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
-        let record = state.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
         if record.expires_at <= now {
-            self.persist(&state)?;
             return Err(PairingError::Expired);
         }
         validate_common(
@@ -391,7 +654,21 @@ impl PairingService {
                 "Status request does not match pairing",
             ));
         }
-        let status = if record.controller_approved == Some(false)
+        self.sign_status_record(record)
+    }
+
+    pub fn signed_provision_status(&self, id: &str) -> Result<SignedEnvelope<Value>, PairingError> {
+        let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
+        self.sign_status_record(record)
+    }
+
+    fn sign_status_record(
+        &self,
+        record: &PairingRecord,
+    ) -> Result<SignedEnvelope<Value>, PairingError> {
+        let now = now_seconds();
+        let approval_status = if record.controller_approved == Some(false)
             || record.operator_approved == Some(false)
         {
             "rejected"
@@ -401,13 +678,25 @@ impl PairingService {
         } else {
             "pending"
         };
+        let status = record
+            .provisioning
+            .as_ref()
+            .map(|provisioning| provisioning.status.as_str())
+            .unwrap_or(approval_status);
+        let provisioning = record
+            .provisioning
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| PairingError::Unavailable)?
+            .unwrap_or(Value::Bool(false));
         sign_json_envelope(&self.service_seed, json!({
-            "kind":"lighthouse-pairing-status", "version":1, "pairingId":id,
+            "kind":"lighthouse-pairing-status", "version":1, "pairingId":record.id,
             "transcriptHash":record.transcript_hash, "servicePersonId":self.service_identity.person_id,
             "serviceDeviceId":self.service_device_id, "serviceOrigin":self.origin,
             "expiresAt":record.expires_at, "operatorApproved":record.operator_approved,
             "controllerApproved":record.controller_approved, "status":status,
-            "provisioning":false, "issuedAt":now,
+            "provisioning":provisioning, "issuedAt":now,
         }), &self.service_device_id, CONTROL_DOMAIN).map_err(|_| PairingError::Unavailable)
     }
 
@@ -442,7 +731,13 @@ impl PairingService {
         Ok(state
             .records
             .values()
-            .filter(|record| record.expires_at > now_seconds())
+            .filter(|record| {
+                record.expires_at > now_seconds()
+                    || record
+                        .provisioning
+                        .as_ref()
+                        .is_some_and(|provisioning| provisioning.status == "active")
+            })
             .cloned()
             .collect())
     }
@@ -456,7 +751,7 @@ impl PairingService {
     ) -> Result<PairingRecord, PairingError> {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         self.require_session(&mut state, cookie, Some(csrf))?;
-        let record = state.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let record = state.records.get(id).ok_or(PairingError::NotFound)?;
         if record.expires_at <= now_seconds() {
             return Err(PairingError::Expired);
         }
@@ -469,19 +764,22 @@ impl PairingService {
         {
             return Err(PairingError::Conflict);
         }
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
         record.operator_approved = Some(decision);
         if !decision {
             record.controller_approved = Some(false);
         }
         let result = record.clone();
-        self.persist(&state)?;
+        self.persist(&next)?;
+        *state = next;
         Ok(result)
     }
 
     pub fn status_json(&self, id: &str) -> Result<Value, PairingError> {
         let state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
-        let status = if record.expires_at <= now_seconds() {
+        let approval_status = if record.expires_at <= now_seconds() {
             "expired"
         } else if record.controller_approved == Some(false)
             || record.operator_approved == Some(false)
@@ -493,8 +791,13 @@ impl PairingService {
         } else {
             "pending"
         };
+        let status = record
+            .provisioning
+            .as_ref()
+            .map(|provisioning| provisioning.status.as_str())
+            .unwrap_or(approval_status);
         Ok(
-            json!({ "id":record.id, "status":status, "expiresAt":record.expires_at, "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved }),
+            json!({ "id":record.id, "status":status, "expiresAt":record.expires_at, "controllerApproved":record.controller_approved, "operatorApproved":record.operator_approved, "provisioning":record.provisioning }),
         )
     }
 
@@ -536,28 +839,9 @@ impl PairingService {
     }
 
     fn persist(&self, state: &PairingState) -> Result<(), PairingError> {
-        let path = self.directory.join("pairings.json");
-        let temporary = self.directory.join("pairings.json.tmp");
         let bytes = serde_json::to_vec(state).map_err(|_| PairingError::Unavailable)?;
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)
-            .map_err(|_| PairingError::Unavailable)?;
-        file.write_all(&bytes)
-            .map_err(|_| PairingError::Unavailable)?;
-        file.sync_all().map_err(|_| PairingError::Unavailable)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-                .map_err(|_| PairingError::Unavailable)?;
-        }
-        fs::rename(temporary, path).map_err(|_| PairingError::Unavailable)?;
-        fs::File::open(self.directory.as_ref())
-            .and_then(|directory| directory.sync_all())
+        FileScopeStore::new(self.directory.join("pairings.json"))
+            .write_validated(&bytes, None, |_, _| Ok(()))
             .map_err(|_| PairingError::Unavailable)
     }
 }

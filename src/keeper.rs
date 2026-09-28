@@ -16,7 +16,7 @@ use meta_mesh_native::{
 };
 use serde_json::{Value, json};
 
-use crate::{Config, join};
+use crate::{Config, ProvisioningCommit, join};
 
 pub(crate) struct Registry {
     config: Config,
@@ -135,6 +135,107 @@ impl KeeperHost {
             .get(&registry.config.workspace_id)
             .ok_or("Missing intake scope")?;
         Ok((scope.store.clone(), scope.local_handshake.peer.clone()))
+    }
+
+    pub(crate) fn configuration(&self) -> Result<Config, String> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?
+            .config
+            .clone())
+    }
+
+    pub(crate) fn provisioning_commit(
+        &self,
+        pairing_id: &str,
+    ) -> Result<Option<ProvisioningCommit>, String> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?
+            .config
+            .provisioning_commits
+            .iter()
+            .find(|commit| commit.pairing_id == pairing_id)
+            .cloned())
+    }
+
+    /// Make fully staged scopes visible in one durable config replacement.
+    /// Caller sends the workspace-join ACK only after this returns success.
+    pub(crate) fn activate_provisioned_scopes(
+        &self,
+        staged: Vec<Config>,
+        commit: ProvisioningCommit,
+    ) -> Result<(), String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let mut next = registry.config.clone();
+        if let Some(previous) = next
+            .provisioning_commits
+            .iter()
+            .find(|previous| previous.pairing_id == commit.pairing_id)
+        {
+            return if previous == &commit {
+                Ok(())
+            } else {
+                Err("Provisioning operation conflicts with durable activation".into())
+            };
+        }
+        if staged.is_empty() {
+            return Err("Provisioning has no staged scopes".into());
+        }
+        let mut staged_hosts = Vec::with_capacity(staged.len());
+        for scope in &staged {
+            if scope.device_id != next.device_id
+                || scope.iroh_secret != next.iroh_secret
+                || scope.device_seed != next.device_seed
+                || scope.identity_seed != next.identity_seed
+            {
+                return Err("Staged scope does not use this keeper identity".into());
+            }
+            if registry.scopes.contains_key(&scope.workspace_id)
+                || staged_hosts
+                    .iter()
+                    .any(|(workspace_id, _): &(String, MatchLighthouseHost)| {
+                        workspace_id == &scope.workspace_id
+                    })
+            {
+                return Err("Provisioned scope already exists".into());
+            }
+            let host = scope_host(scope)?;
+            if scope.controller_person_id.as_deref()
+                != Some(
+                    host.store
+                        .authority()?
+                        .expected_current_owner
+                        .person_id
+                        .as_str(),
+                )
+            {
+                return Err("Staged scope controller is not its verified current owner".into());
+            }
+            staged_hosts.push((scope.workspace_id.clone(), host));
+            next.additional_scopes.push(scope.clone());
+        }
+        let staged_ids = staged
+            .iter()
+            .map(|scope| scope.workspace_id.clone())
+            .collect::<Vec<_>>();
+        if commit.workspace_ids != staged_ids {
+            return Err("Provisioning commit does not match staged scopes".into());
+        }
+        next.provisioning_commits.push(commit);
+        FileScopeStore::new(&registry.config_path).write_validated(
+            &serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+            None,
+            |_, _| Ok(()),
+        )?;
+        registry.config = next;
+        registry.scopes.extend(staged_hosts);
+        Ok(())
     }
 
     pub(crate) fn attach_owner_inventory(

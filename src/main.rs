@@ -15,28 +15,41 @@ mod http;
 mod join;
 mod keeper;
 mod pairing;
+mod provisioning;
 mod replication;
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Config {
-    workspace_id: String,
-    transport_secret: String,
-    device_id: String,
-    iroh_secret: Vec<u8>,
-    owner_endpoint_id: String,
-    local_handshake: MeshHandshake,
-    genesis_person_id: String,
-    state_path: PathBuf,
-    initial_state: MatchLighthouseState,
+    pub(crate) workspace_id: String,
+    pub(crate) transport_secret: String,
+    pub(crate) device_id: String,
+    pub(crate) iroh_secret: Vec<u8>,
+    pub(crate) owner_endpoint_id: String,
+    pub(crate) local_handshake: MeshHandshake,
+    pub(crate) genesis_person_id: String,
+    pub(crate) state_path: PathBuf,
+    pub(crate) initial_state: MatchLighthouseState,
     #[serde(default)]
-    identity_seed: Vec<u8>,
+    pub(crate) identity_seed: Vec<u8>,
     #[serde(default)]
-    device_seed: Vec<u8>,
+    pub(crate) device_seed: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    additional_scopes: Vec<Config>,
+    pub(crate) additional_scopes: Vec<Config>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    controller_person_id: Option<String>,
+    pub(crate) controller_person_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) provisioning_commits: Vec<ProvisioningCommit>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProvisioningCommit {
+    pub(crate) pairing_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) transcript_hash: String,
+    pub(crate) invitation_id: String,
+    pub(crate) workspace_ids: Vec<String>,
 }
 
 #[tokio::main]
@@ -119,6 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?,
     );
     let host = keeper::KeeperHost::open(config.clone(), fs::canonicalize(&path)?)?;
+    let discovery = discovery.map(|discovery| {
+        discovery.with_provisioner(provisioning::ProvisioningService::new(
+            host.clone(),
+            Arc::clone(&node),
+        ))
+    });
     let service = Arc::new(Mutex::new(NativeScopeService::new(host.clone())));
     if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
         let directory = config
