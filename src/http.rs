@@ -10,8 +10,10 @@ use std::{
 
 use axum::{
     Json, Router,
+    extract::Path as AxumPath,
     extract::{DefaultBodyLimit, State},
     http::{HeaderValue, Method, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -25,6 +27,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tower_http::cors::CorsLayer;
+
+use crate::pairing::{
+    ControllerRequest, LoginRequest, PairingError, PairingService, SessionResponse,
+};
 
 const MAX_PENDING: usize = 100;
 const MAX_CONCURRENT_INGEST: usize = 8;
@@ -51,12 +57,14 @@ struct AppState {
     captcha: Captcha,
     ingest_slots: Arc<Semaphore>,
     discovery: Option<Discovery>,
+    pairings: Option<PairingService>,
     cors_origins: Arc<Vec<String>>,
 }
 
 #[derive(Clone)]
 pub struct Discovery {
     descriptor: Value,
+    pairings: Option<PairingService>,
 }
 
 impl Discovery {
@@ -114,7 +122,14 @@ impl Discovery {
                 "publicOrigin": origin.origin().ascii_serialization(),
                 "managementPath": "/admin"
             }),
+            pairings: None,
         })
+    }
+
+    pub fn with_pairings(mut self, pairings: PairingService) -> Self {
+        self.descriptor["capabilities"]["pairing"] = Value::Bool(true);
+        self.pairings = Some(pairings);
+        self
     }
 }
 
@@ -247,6 +262,7 @@ pub async fn serve(
     for origin in &cors_origins {
         allowed_origins.push(origin.parse::<HeaderValue>()?);
     }
+    let pairings = discovery.as_ref().and_then(|item| item.pairings.clone());
     let state = AppState {
         inbox: Inbox {
             directory: Arc::new(inbox),
@@ -259,6 +275,7 @@ pub async fn serve(
         },
         ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
         discovery,
+        pairings,
         cors_origins: Arc::new(cors_origins),
     };
     let processing_inbox = state.inbox.clone();
@@ -274,6 +291,14 @@ fn http_app(state: AppState, allowed_origins: Vec<HeaderValue>) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/.well-known/mesh-lighthouse", get(discover))
+        .route("/v1/pairings", post(create_pairing))
+        .route("/v1/pairings/{id}/decision", post(pairing_decision))
+        .route("/v1/pairings/{id}/status", post(pairing_status))
+        .route("/admin", get(admin_page))
+        .route("/admin/", get(admin_page))
+        .route("/admin/api/session", post(admin_login))
+        .route("/admin/api/pairings", get(admin_list))
+        .route("/admin/api/pairings/{id}/decision", post(admin_decision))
         .route("/challenge", get(challenge))
         .route("/ingest", post(ingest))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -284,6 +309,161 @@ fn http_app(state: AppState, allowed_origins: Vec<HeaderValue>) -> Router {
                 .allow_headers([header::CONTENT_TYPE]),
         )
         .with_state(state)
+}
+
+async fn create_pairing(
+    State(state): State<AppState>,
+    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+) -> Result<(StatusCode, Json<Value>), PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let record = pairings.create(request).map_err(PairingResponseError)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "pairingId":record.id,
+            "expiresAt":record.expires_at,
+            "operatorUrl":format!("{}/admin/?pairing={}", state.discovery.as_ref().and_then(|d| d.descriptor["publicOrigin"].as_str()).unwrap_or_default(), record.id),
+            "challenge":record.challenge,
+            "comparisonCode":record.comparison_code,
+            "transcriptHash":record.transcript_hash,
+        })),
+    ))
+}
+
+async fn pairing_decision(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let record = pairings
+        .controller_decision(&id, request)
+        .map_err(PairingResponseError)?;
+    Ok(Json(
+        json!({ "pairingId": record.id, "status": pairings.status_json(&record.id).map_err(PairingResponseError)? }),
+    ))
+}
+
+async fn pairing_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    Ok(Json(
+        serde_json::to_value(
+            pairings
+                .status(&id, request)
+                .map_err(PairingResponseError)?,
+        )
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
+    ))
+}
+
+async fn admin_login(
+    State(state): State<AppState>,
+    axum::extract::Json(input): axum::extract::Json<LoginRequest>,
+) -> Result<Response, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let (cookie, csrf) = pairings
+        .login(&input.secret)
+        .map_err(PairingResponseError)?;
+    let secure = state
+        .discovery
+        .as_ref()
+        .and_then(|d| d.descriptor["publicOrigin"].as_str())
+        .is_some_and(|origin| origin.starts_with("https://"));
+    let secure_suffix = if secure { "; Secure" } else { "" };
+    let mut response = Json(SessionResponse { csrf_token: csrf }).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin={cookie}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=28800{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    Ok(response)
+}
+
+async fn admin_list(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let records = pairings.admin_list(cookie).map_err(PairingResponseError)?;
+    let rows = records.iter().map(|record| json!({
+        "id":record.id,"expiresAt":record.expires_at,"comparisonCode":record.comparison_code,
+        "controller":record.controller,"controllerDeviceId":record.controller_device_id,
+        "controllerFingerprint":PairingService::fingerprint(&record.controller.public_key),
+        "serviceFingerprint":pairings.service_fingerprint(),
+        "scopes":record.offer["body"]["scopes"],"transcriptHash":record.transcript_hash,
+        "operatorApproved":record.operator_approved,"controllerApproved":record.controller_approved,
+    })).collect::<Vec<_>>();
+    Ok(Json(json!({"pairings":rows})))
+}
+
+async fn admin_decision(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Json(input): axum::extract::Json<Value>,
+) -> Result<Json<Value>, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let approved = match input["decision"].as_str() {
+        Some("approve") => true,
+        Some("decline") => false,
+        _ => {
+            return Err(PairingResponseError(PairingError::Invalid(
+                "Decision must be approve or decline",
+            )));
+        }
+    };
+    let record = pairings
+        .admin_decision(&id, cookie, csrf, approved)
+        .map_err(PairingResponseError)?;
+    Ok(Json(
+        json!({"pairingId":record.id,"status":pairings.status_json(&record.id).map_err(PairingResponseError)?}),
+    ))
+}
+
+async fn admin_page() -> axum::response::Html<&'static str> {
+    axum::response::Html(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Lighthouse approval</title><main><h1>Lighthouse approvals</h1><form id="login"><label>Operator token <input id="secret" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="message" role="status"></p><section id="requests"></section></main><script>
+    let csrf=""; const message=document.querySelector('#message');
+    async function api(path, options={}) { const response=await fetch(path,{...options,headers:{'content-type':'application/json',...(csrf?{'x-csrf-token':csrf}:{}),...(options.headers||{})}}); const value=await response.json().catch(()=>({})); if(!response.ok) throw new Error(value.message||`Request failed (${response.status})`); return value; }
+    async function load(){const data=await api('/admin/api/pairings'); document.querySelector('#requests').innerHTML=''; for(const p of data.pairings){const row=document.createElement('article'); const title=document.createElement('h2'); title.textContent=`${p.controller.displayName} · ${p.comparisonCode}`; row.append(title); const fingerprints=document.createElement('p'); fingerprints.textContent=`Controller ${p.controllerFingerprint} · service ${p.serviceFingerprint}`; row.append(fingerprints); const list=document.createElement('ul'); for(const s of p.scopes){const li=document.createElement('li'); li.textContent=`${s.title} · ${s.mode}`; list.append(li)} row.append(list); const status=document.createElement('p'); status.textContent=`Controller approval: ${p.controllerApproved===true?'approved':p.controllerApproved===false?'declined':'pending'}`; row.append(status); for(const decision of ['approve','decline']){const button=document.createElement('button'); button.textContent=decision==='approve'?'Approve exact boards':'Decline'; button.disabled=p.operatorApproved!==null||p.controllerApproved===false; button.onclick=async()=>{await api(`/admin/api/pairings/${encodeURIComponent(p.id)}/decision`,{method:'POST',body:JSON.stringify({decision})}); await load()}; row.append(button)} document.querySelector('#requests').append(row)}}
+    document.querySelector('#login').onsubmit=async event=>{event.preventDefault();try{const result=await api('/admin/api/session',{method:'POST',body:JSON.stringify({secret:document.querySelector('#secret').value})});csrf=result.csrfToken;document.querySelector('#login').hidden=true;message.textContent='Signed in';await load()}catch(error){message.textContent=error.message}};
+    </script></html>"#,
+    )
+}
+
+fn admin_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|pair| pair.trim().strip_prefix("mesh_lighthouse_admin="))
+}
+
+struct PairingResponseError(PairingError);
+impl IntoResponse for PairingResponseError {
+    fn into_response(self) -> Response {
+        let error = self.0;
+        (error.status(), Json(json!({"code":error.code(),"message":error.message(),"retryable":matches!(error, PairingError::Unavailable)}))).into_response()
+    }
 }
 
 async fn discover(
@@ -1093,6 +1273,12 @@ fn set_private_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pairing::CONTROL_DOMAIN;
+    use meta_mesh_core::{
+        DeviceCertificate, DeviceCertificatePayload, PublicIdentity, public_key_from_seed,
+        public_key_id, sign_device_certificate, sign_json_envelope,
+    };
+    use rand::RngExt;
 
     #[test]
     fn discovery_reuses_public_service_identity_and_excludes_private_or_tenant_data() {
@@ -1123,6 +1309,333 @@ mod tests {
         ] {
             assert!(!serialized.contains(secret));
         }
+    }
+
+    fn signed_test_peer(
+        name: &str,
+    ) -> (
+        Value,
+        [u8; 32],
+        PublicIdentity,
+        String,
+        Vec<DeviceCertificate>,
+    ) {
+        let mut identity_seed = [0; 32];
+        let mut device_seed = [0; 32];
+        rand::rng().fill(&mut identity_seed);
+        rand::rng().fill(&mut device_seed);
+        let identity_key = public_key_from_seed(&identity_seed).unwrap();
+        let person_id = public_key_id(&identity_key).unwrap();
+        let device_key = public_key_from_seed(&device_seed).unwrap();
+        let device_id = public_key_id(&device_key).unwrap();
+        let identity = PublicIdentity {
+            person_id: person_id.clone(),
+            public_key: identity_key.clone(),
+            display_name: name.to_owned(),
+        };
+        let certificate = sign_device_certificate(
+            &identity_seed,
+            DeviceCertificatePayload {
+                kind: "device-certificate".into(),
+                version: 1,
+                person_id,
+                device_id: device_id.clone(),
+                device_public_key: device_key,
+                issuer_certificate_hash: None,
+                can_enroll_devices: true,
+            },
+            &identity.person_id,
+            "MATCH/1",
+        )
+        .unwrap();
+        let peer = json!({
+            "advertisement": { "payload": { "personId": identity.person_id, "deviceId": device_id, "deviceName": name } },
+            "publicKey": identity.public_key,
+            "certificates": [certificate.clone()],
+        });
+        (peer, device_seed, identity, device_id, vec![certificate])
+    }
+
+    fn request_bundle(
+        seed: &[u8; 32],
+        identity: &PublicIdentity,
+        device_id: &str,
+        certificates: &[meta_mesh_core::DeviceCertificate],
+        payload: Value,
+    ) -> Value {
+        json!({
+            "identity": identity,
+            "deviceId": device_id,
+            "certificates": certificates,
+            "signed": sign_json_envelope(seed, payload, device_id, CONTROL_DOMAIN).unwrap(),
+        })
+    }
+
+    fn common_payload(
+        kind: &str,
+        identity: &PublicIdentity,
+        device_id: &str,
+        service_id: &str,
+        origin: &str,
+        _operation_id: &str,
+    ) -> Value {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json!({
+            "kind":kind,"version":1,"protocolVersion":1,
+            "servicePersonId":service_id,"serviceOrigin":origin,
+            "controllerPersonId":identity.person_id,"controllerDeviceId":device_id,
+            "operationId":URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>()),"issuedAt":now,"expiresAt":now+600,
+        })
+    }
+
+    #[tokio::test]
+    async fn real_http_pairing_requires_both_signed_approvals_and_operator_csrf() {
+        let root =
+            std::env::temp_dir().join(format!("lighthouse-pairing-http-{}", rand::random::<u64>()));
+        let (service_peer, service_seed, service_identity, _, _) =
+            signed_test_peer("Operator Lighthouse");
+        let (
+            _controller_peer,
+            controller_seed,
+            controller_identity,
+            controller_device,
+            controller_certificates,
+        ) = signed_test_peer("Match owner");
+        let origin = "http://127.0.0.1:18189";
+        let pairing_service = PairingService::open(
+            root.join("pairing-state"),
+            &service_peer,
+            origin.into(),
+            service_seed,
+            "test-operator-token-that-is-long-enough".into(),
+        )
+        .unwrap();
+        let discovery = Discovery::from_peer(&service_peer, origin)
+            .unwrap()
+            .with_pairings(pairing_service.clone());
+        let mut captcha_seed = [0; 32];
+        rand::rng().fill(&mut captcha_seed);
+        let inbox_path = root.join("inbox");
+        fs::create_dir_all(&inbox_path).unwrap();
+        let state = AppState {
+            inbox: Inbox {
+                directory: Arc::new(inbox_path.clone()),
+                results: Arc::new(root.join("results")),
+                write_lock: Arc::new(Mutex::new(())),
+            },
+            captcha: Captcha {
+                secret: Arc::new(captcha_seed),
+                used: Arc::new(root.join("captcha-used")),
+            },
+            ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
+            discovery: Some(discovery),
+            pairings: Some(pairing_service.clone()),
+            cors_origins: Arc::new(vec![]),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, http_app(state, vec![]))
+                .await
+                .unwrap()
+        });
+        let client = reqwest::Client::new();
+        let test_origin = format!("http://{address}");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut offer = common_payload(
+            "lighthouse-pairing-offer",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            origin,
+            "operation-0123456789abcdef",
+        );
+        offer["body"] = json!({ "scopes":[{"workspaceId":"disposable-board","title":"Disposable board","genesisAnchor":"signed-genesis-anchor","mode":"replicate"}], "policy":{"futureBoards":false} });
+        let offer_request = request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certificates,
+            offer,
+        );
+        let created = client
+            .post(format!("{test_origin}/v1/pairings"))
+            .json(&offer_request)
+            .send()
+            .await
+            .unwrap();
+        let created_status = created.status();
+        let created_body = created.text().await.unwrap();
+        assert_eq!(created_status, StatusCode::ACCEPTED, "{created_body}");
+        let created: Value = serde_json::from_str(&created_body).unwrap();
+        let pairing_id = created["pairingId"].as_str().unwrap();
+        let transcript_hash = created["transcriptHash"].as_str().unwrap();
+        let nonce = created["challenge"]["payload"]["nonce"].as_str().unwrap();
+
+        assert_eq!(
+            client
+                .get(format!("{test_origin}/admin/api/pairings"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let login = client
+            .post(format!("{test_origin}/admin/api/session"))
+            .json(&json!({"secret":"test-operator-token-that-is-long-enough"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let login_body: Value = login.json().await.unwrap();
+        let operator_list = client
+            .get(format!("{test_origin}/admin/api/pairings"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(operator_list.status(), StatusCode::OK);
+        let listed: Value = operator_list.json().await.unwrap();
+        assert_eq!(
+            listed["pairings"][0]["comparisonCode"],
+            created["comparisonCode"]
+        );
+        assert_eq!(
+            listed["pairings"][0]["scopes"][0]["title"],
+            "Disposable board"
+        );
+        assert!(
+            !listed["pairings"][0]["controllerFingerprint"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !listed["pairings"][0]["serviceFingerprint"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let decision_url = format!("{test_origin}/admin/api/pairings/{pairing_id}/decision");
+        assert_eq!(
+            client
+                .post(&decision_url)
+                .header(header::COOKIE, &cookie)
+                .json(&json!({"decision":"approve"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let operator_approval = client
+            .post(&decision_url)
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", login_body["csrfToken"].as_str().unwrap())
+            .json(&json!({"decision":"approve"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(operator_approval.status(), StatusCode::OK);
+        assert_eq!(
+            operator_approval.json::<Value>().await.unwrap()["status"]["status"],
+            "pending"
+        );
+
+        let mut decision = common_payload(
+            "lighthouse-pairing-decision",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            origin,
+            "decision-0123456789abcdef",
+        );
+        decision["pairingId"] = json!(pairing_id);
+        decision["transcriptHash"] = json!(transcript_hash);
+        decision["challengeNonce"] = json!(nonce);
+        decision["decision"] = json!("approve");
+        let signed_decision = request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certificates,
+            decision,
+        );
+        let response = client
+            .post(format!("{test_origin}/v1/pairings/{pairing_id}/decision"))
+            .json(&signed_decision)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["status"]["status"],
+            "approved"
+        );
+
+        let mut status_payload = common_payload(
+            "lighthouse-pairing-status",
+            &controller_identity,
+            &controller_device,
+            &service_identity.person_id,
+            origin,
+            "status-0123456789abcdef",
+        );
+        status_payload["pairingId"] = json!(pairing_id);
+        status_payload["transcriptHash"] = json!(transcript_hash);
+        let status_request = request_bundle(
+            &controller_seed,
+            &controller_identity,
+            &controller_device,
+            &controller_certificates,
+            status_payload,
+        );
+        let status = client
+            .post(format!("{test_origin}/v1/pairings/{pairing_id}/status"))
+            .json(&status_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let envelope: Value = status.json().await.unwrap();
+        assert_eq!(envelope["payload"]["status"], "approved");
+        assert_eq!(envelope["payload"]["provisioning"], false);
+        assert_eq!(
+            envelope["signerKeyId"],
+            service_peer["advertisement"]["payload"]["deviceId"]
+        );
+        assert!(now + 600 >= envelope["payload"]["expiresAt"].as_u64().unwrap());
+        let restored = PairingService::open(
+            root.join("pairing-state"),
+            &service_peer,
+            origin.into(),
+            service_seed,
+            "test-operator-token-that-is-long-enough".into(),
+        )
+        .unwrap();
+        let restored_status = restored
+            .status(pairing_id, serde_json::from_value(status_request).unwrap())
+            .unwrap();
+        assert_eq!(restored_status.payload["status"], "approved");
+        server.abort();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1158,6 +1671,7 @@ mod tests {
             },
             ingest_slots: Arc::new(Semaphore::new(1)),
             discovery: Some(Discovery::from_peer(&peer, "https://keeper.example").unwrap()),
+            pairings: None,
             cors_origins: Arc::new(vec!["https://match.example".into()]),
         };
         let allowed_origin = "https://match.example".parse::<HeaderValue>().unwrap();

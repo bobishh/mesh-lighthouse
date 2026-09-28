@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 mod http;
 mod join;
 mod keeper;
+mod pairing;
 mod replication;
 
 #[derive(Clone, Deserialize, serde::Serialize)]
@@ -72,10 +73,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let config: Config = serde_json::from_slice(&fs::read(&path)?)?;
     let discovery = match std::env::var("LIGHTHOUSE_PUBLIC_ORIGIN") {
-        Ok(origin) => Some(
-            http::Discovery::from_peer(&config.local_handshake.peer, &origin)
-                .map_err(std::io::Error::other)?,
-        ),
+        Ok(origin) => {
+            let mut discovery = http::Discovery::from_peer(&config.local_handshake.peer, &origin)
+                .map_err(std::io::Error::other)?;
+            if let Ok(admin_secret) = std::env::var("LIGHTHOUSE_ADMIN_TOKEN") {
+                let seed: [u8; 32] = config
+                    .device_seed
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "Lighthouse device seed must contain 32 bytes")?;
+                discovery = discovery.with_pairings(
+                    pairing::PairingService::open(
+                        config.state_path.with_file_name("pairings"),
+                        &config.local_handshake.peer,
+                        origin,
+                        seed,
+                        admin_secret,
+                    )
+                    .map_err(std::io::Error::other)?,
+                );
+            }
+            Some(discovery)
+        }
         Err(_) => None,
     };
     let device_seed: [u8; 32] = config
@@ -195,10 +214,26 @@ fn load_discovery(
         return Ok(None);
     }
     let config: Config = serde_json::from_slice(&fs::read(config_path)?)?;
-    Ok(Some(
-        http::Discovery::from_peer(&config.local_handshake.peer, &public_origin)
+    let mut discovery = http::Discovery::from_peer(&config.local_handshake.peer, &public_origin)
+        .map_err(std::io::Error::other)?;
+    if let Ok(admin_secret) = std::env::var("LIGHTHOUSE_ADMIN_TOKEN") {
+        let seed: [u8; 32] = config
+            .device_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Lighthouse device seed must contain 32 bytes")?;
+        discovery = discovery.with_pairings(
+            pairing::PairingService::open(
+                directory.join("pairings"),
+                &config.local_handshake.peer,
+                public_origin,
+                seed,
+                admin_secret,
+            )
             .map_err(std::io::Error::other)?,
-    ))
+        );
+    }
+    Ok(Some(discovery))
 }
 
 fn refresh_route(
