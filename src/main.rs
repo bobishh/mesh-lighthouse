@@ -64,12 +64,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if args.next().is_some() {
             return Err("Too many serve-http arguments".into());
         }
-        return http::serve(directory, address, None).await;
+        let discovery = load_discovery(&directory)?;
+        return http::serve(directory, address, None, discovery).await;
     }
     if args.next().is_some() {
         return Err("Too many arguments".into());
     }
     let config: Config = serde_json::from_slice(&fs::read(&path)?)?;
+    let discovery = match std::env::var("LIGHTHOUSE_PUBLIC_ORIGIN") {
+        Ok(origin) => Some(
+            http::Discovery::from_peer(&config.local_handshake.peer, &origin)
+                .map_err(std::io::Error::other)?,
+        ),
+        Err(_) => None,
+    };
     let device_seed: [u8; 32] = config
         .device_seed
         .as_slice()
@@ -136,7 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
         tokio::spawn(async move {
-            if let Err(error) = http::serve(directory, address, Some(lead_sender)).await {
+            if let Err(error) = http::serve(directory, address, Some(lead_sender), discovery).await
+            {
                 eprintln!("Lighthouse HTTP: {error}");
             }
         });
@@ -173,6 +182,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     route_store.write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
     host.refresh_routes(route_sequence)?;
     replication::run(node, service, host).await
+}
+
+fn load_discovery(
+    directory: &std::path::Path,
+) -> Result<Option<http::Discovery>, Box<dyn std::error::Error + Send + Sync>> {
+    let Ok(public_origin) = std::env::var("LIGHTHOUSE_PUBLIC_ORIGIN") else {
+        return Ok(None);
+    };
+    let config_path = directory.join("config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config: Config = serde_json::from_slice(&fs::read(config_path)?)?;
+    Ok(Some(
+        http::Discovery::from_peer(&config.local_handshake.peer, &public_origin)
+            .map_err(std::io::Error::other)?,
+    ))
 }
 
 fn refresh_route(

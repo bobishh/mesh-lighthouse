@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{Method, StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, header},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -50,6 +50,72 @@ struct AppState {
     inbox: Inbox,
     captcha: Captcha,
     ingest_slots: Arc<Semaphore>,
+    discovery: Option<Discovery>,
+    cors_origins: Arc<Vec<String>>,
+}
+
+#[derive(Clone)]
+pub struct Discovery {
+    descriptor: Value,
+}
+
+impl Discovery {
+    pub fn from_peer(peer: &Value, public_origin: &str) -> Result<Self, String> {
+        let origin = Url::parse(public_origin)
+            .map_err(|_| "Invalid LIGHTHOUSE_PUBLIC_ORIGIN".to_string())?;
+        let loopback = origin
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
+        if origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+            || (origin.scheme() != "https" && !(loopback && origin.scheme() == "http"))
+        {
+            return Err(
+                "LIGHTHOUSE_PUBLIC_ORIGIN must be an HTTPS origin (HTTP allowed on loopback)"
+                    .into(),
+            );
+        }
+        let identity = peer
+            .pointer("/advertisement/payload")
+            .or_else(|| peer.pointer("/payload"))
+            .ok_or("Missing public Lighthouse identity advertisement")?;
+        let field = |key: &str| {
+            identity
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("Missing public Lighthouse identity field: {key}"))
+        };
+        let certificates = peer
+            .get("certificates")
+            .cloned()
+            .filter(Value::is_array)
+            .ok_or("Missing public Lighthouse device certificates")?;
+        let service = json!({
+            "personId": field("personId")?,
+            "publicKey": peer.get("publicKey").and_then(Value::as_str).ok_or("Missing public Lighthouse public key")?,
+            "deviceId": field("deviceId")?,
+            "certificates": certificates,
+        });
+        Ok(Self {
+            descriptor: json!({
+                "protocolVersions": [1],
+                "service": service,
+                "displayName": identity.get("deviceName").and_then(Value::as_str).unwrap_or("Lighthouse"),
+                "capabilities": {
+                    "products": ["match"],
+                    "modes": ["replicate"],
+                    "documentReplication": true,
+                    "chatReplication": true,
+                    "blobReplication": false,
+                    "pairing": false,
+                    "provisioning": false
+                },
+                "publicOrigin": origin.origin().ascii_serialization(),
+                "managementPath": "/admin"
+            }),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -155,6 +221,7 @@ pub async fn serve(
     directory: PathBuf,
     address: SocketAddr,
     lead_sender: Option<LeadSender>,
+    discovery: Option<Discovery>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inbox = directory.join("inbox");
     let results = directory.join("results");
@@ -165,6 +232,21 @@ pub async fn serve(
     }
     let mut secret = [0_u8; 32];
     rand::rng().fill_bytes(&mut secret);
+    let cors_origins = std::env::var("LIGHTHOUSE_CORS_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut allowed_origins = vec![
+        "https://meta-uber-engineer.dev".parse::<HeaderValue>()?,
+        "http://127.0.0.1:18181".parse::<HeaderValue>()?,
+        "http://localhost:18181".parse::<HeaderValue>()?,
+    ];
+    for origin in &cors_origins {
+        allowed_origins.push(origin.parse::<HeaderValue>()?);
+    }
     let state = AppState {
         inbox: Inbox {
             directory: Arc::new(inbox),
@@ -176,29 +258,55 @@ pub async fn serve(
             used: Arc::new(captcha_used),
         },
         ingest_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST)),
+        discovery,
+        cors_origins: Arc::new(cors_origins),
     };
     let processing_inbox = state.inbox.clone();
     tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
-    let app = Router::new()
+    let app = http_app(state, allowed_origins);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    println!("Lighthouse HTTP listening on {address}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn http_app(state: AppState, allowed_origins: Vec<HeaderValue>) -> Router {
+    Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+        .route("/.well-known/mesh-lighthouse", get(discover))
         .route("/challenge", get(challenge))
         .route("/ingest", post(ingest))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(
             CorsLayer::new()
-                .allow_origin([
-                    "https://meta-uber-engineer.dev".parse::<axum::http::HeaderValue>()?,
-                    "http://127.0.0.1:18181".parse::<axum::http::HeaderValue>()?,
-                    "http://localhost:18181".parse::<axum::http::HeaderValue>()?,
-                ])
+                .allow_origin(allowed_origins)
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([header::CONTENT_TYPE]),
         )
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Lighthouse HTTP listening on {address}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
+}
+
+async fn discover(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !state.cors_origins.iter().any(|allowed| allowed == origin) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "code": "origin_not_allowed", "message": "Origin is not in the configured Lighthouse CORS allowlist", "retryable": false
+                })),
+            ));
+        }
+    }
+    state.discovery.as_ref().map(|discovery| Json(discovery.descriptor.clone()))
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "code": "discovery_not_configured", "message": "Configure LIGHTHOUSE_PUBLIC_ORIGIN and start Lighthouse with its service identity", "retryable": false
+        }))))
 }
 
 async fn challenge(State(state): State<AppState>) -> Result<Json<Challenge>, StatusCode> {
@@ -985,6 +1093,111 @@ fn set_private_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_reuses_public_service_identity_and_excludes_private_or_tenant_data() {
+        let peer = json!({
+            "advertisement": { "payload": {
+                "personId": "public-person", "deviceId": "public-device", "deviceName": "My Keeper",
+                "workspaceId": "private-board-id", "transportSecret": "private-transport-secret"
+            }},
+            "publicKey": "public-key",
+            "certificates": [{"payload": {"deviceId": "public-device"}}],
+            "identitySeed": "private-identity-seed", "privateKey": "private-key"
+        });
+
+        let discovery = Discovery::from_peer(&peer, "https://keeper.example").unwrap();
+        let body = discovery.descriptor;
+        assert_eq!(body["protocolVersions"], json!([1]));
+        assert_eq!(body["service"]["personId"], "public-person");
+        assert_eq!(body["service"]["deviceId"], "public-device");
+        assert_eq!(body["publicOrigin"], "https://keeper.example");
+        assert_eq!(body["capabilities"]["pairing"], false);
+        assert_eq!(body["capabilities"]["provisioning"], false);
+        let serialized = body.to_string();
+        for secret in [
+            "private-board-id",
+            "private-transport-secret",
+            "private-identity-seed",
+            "private-key",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn discovery_allows_http_only_for_loopback_and_requires_an_origin() {
+        let peer = json!({
+            "advertisement": { "payload": {"personId":"p", "deviceId":"d", "deviceName":"Lighthouse"} },
+            "publicKey":"k", "certificates":[]
+        });
+        assert!(Discovery::from_peer(&peer, "http://127.0.0.1:8080").is_ok());
+        assert!(Discovery::from_peer(&peer, "http://keeper.example").is_err());
+        assert!(Discovery::from_peer(&peer, "https://keeper.example/admin").is_err());
+        assert!(Discovery::from_peer(&peer, "").is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_is_served_by_the_standalone_http_router() {
+        let root =
+            std::env::temp_dir().join(format!("lighthouse-discovery-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let peer = json!({
+            "advertisement": { "payload": {"personId":"service-person", "deviceId":"service-device", "deviceName":"Test Keeper"} },
+            "publicKey":"service-public-key", "certificates":[{"certificate":"public-certificate"}]
+        });
+        let state = AppState {
+            inbox: Inbox {
+                directory: Arc::new(root.join("inbox")),
+                results: Arc::new(root.join("results")),
+                write_lock: Arc::new(Mutex::new(())),
+            },
+            captcha: Captcha {
+                secret: Arc::new([1_u8; 32]),
+                used: Arc::new(root.join("captcha-used")),
+            },
+            ingest_slots: Arc::new(Semaphore::new(1)),
+            discovery: Some(Discovery::from_peer(&peer, "https://keeper.example").unwrap()),
+            cors_origins: Arc::new(vec!["https://match.example".into()]),
+        };
+        let allowed_origin = "https://match.example".parse::<HeaderValue>().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, http_app(state, vec![allowed_origin]))
+                .await
+                .unwrap()
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/.well-known/mesh-lighthouse");
+        let response = client
+            .get(&url)
+            .header(header::ORIGIN, "https://match.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://match.example"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["service"]["personId"], "service-person");
+        assert_eq!(body["publicOrigin"], "https://keeper.example");
+        assert_eq!(body["capabilities"]["pairing"], false);
+        assert!(!body.to_string().contains("private"));
+        let denied = client
+            .get(url)
+            .header(header::ORIGIN, "https://unlisted.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        server.abort();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn signed_human_check_is_single_use() {
