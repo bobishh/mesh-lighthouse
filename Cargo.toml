@@ -17,9 +17,9 @@ axum = "0.8"
 base64 = "0.22"
 hmac = "0.12"
 jev-sdk = "=0.1.0"
-match-authority = { git = "https://github.com/bobishh/match.git", rev = "93c45d72246039f782b199b3e224896ed63b15a2" }
-meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "df127a3054e89bf8c5b2d83ac3c6b22c44a1bbc7" }
-meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "df127a3054e89bf8c5b2d83ac3c6b22c44a1bbc7" }
+match-authority = { git = "https://github.com/bobishh/match.git", rev = "a43fbdf70334dc8fcc2759a2df9ed54a19621ed6" }
+meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "c37ce967f51a0f7899542b26a659da08026fa5c0" }
+meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "c37ce967f51a0f7899542b26a659da08026fa5c0" }
 automerge = "0.12"
 iroh = "1.2.0"
 rand = "0.10"
