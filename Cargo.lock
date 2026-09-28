@@ -674,7 +674,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.6",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2171,7 +2171,7 @@ dependencies = [
 [[package]]
 name = "match-authority"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/match.git?rev=b3bbfa5560e0387c34566a5124b8b7ac8fbfb780#b3bbfa5560e0387c34566a5124b8b7ac8fbfb780"
+source = "git+https://github.com/bobishh/match.git?rev=08e9caafcdd4557da3d69a94f38bb3a28ec1340a#08e9caafcdd4557da3d69a94f38bb3a28ec1340a"
 dependencies = [
  "automerge",
  "meta-mesh-core",
@@ -2237,7 +2237,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-core"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=c37ce967f51a0f7899542b26a659da08026fa5c0#c37ce967f51a0f7899542b26a659da08026fa5c0"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5432eacb865a1d2fc3237620e3e0fabc09005d#de5432eacb865a1d2fc3237620e3e0fabc09005d"
 dependencies = [
  "aes-gcm",
  "automerge",
@@ -2257,7 +2257,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-native"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=c37ce967f51a0f7899542b26a659da08026fa5c0#c37ce967f51a0f7899542b26a659da08026fa5c0"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5432eacb865a1d2fc3237620e3e0fabc09005d#de5432eacb865a1d2fc3237620e3e0fabc09005d"
 dependencies = [
  "blake3",
  "bytes",
