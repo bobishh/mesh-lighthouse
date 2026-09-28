@@ -15,6 +15,13 @@ impl ProvisioningService {
         Self { host, node }
     }
 
+    pub(crate) fn durable_commit(
+        &self,
+        pairing_id: &str,
+    ) -> Result<Option<ProvisioningCommit>, String> {
+        self.host.provisioning_commit(pairing_id)
+    }
+
     pub(crate) async fn provision(
         &self,
         pairing_id: &str,
@@ -22,20 +29,29 @@ impl ProvisioningService {
         transcript_hash: &str,
         invitation: meta_mesh_core::WorkspaceJoinInvitation,
         workspace_ids: Vec<String>,
+        future_boards: bool,
     ) -> Result<Vec<ProvisionedScope>, String> {
         let invitation_id = invitation.invitation_id.clone();
+        let expected_commit = ProvisioningCommit {
+            pairing_id: pairing_id.into(),
+            operation_id: operation_id.into(),
+            transcript_hash: transcript_hash.into(),
+            invitation_id: invitation_id.clone(),
+            workspace_ids: workspace_ids.clone(),
+            snapshot_hash: String::new(),
+            future_boards,
+        };
         if let Some(previous) = self.host.provisioning_commit(pairing_id)? {
-            let requested = ProvisioningCommit {
-                pairing_id: pairing_id.into(),
-                operation_id: operation_id.into(),
-                transcript_hash: transcript_hash.into(),
-                invitation_id,
-                workspace_ids: workspace_ids.clone(),
-            };
-            if previous != requested {
+            if previous.pairing_id != expected_commit.pairing_id
+                || previous.operation_id != expected_commit.operation_id
+                || previous.transcript_hash != expected_commit.transcript_hash
+                || previous.invitation_id != expected_commit.invitation_id
+                || previous.workspace_ids != expected_commit.workspace_ids
+                || previous.future_boards != expected_commit.future_boards
+                || previous.snapshot_hash.is_empty()
+            {
                 return Err("Provisioning retry conflicts with durable activation".into());
             }
-            return Ok(active_scopes(workspace_ids));
         }
 
         let config: Config = self.host.configuration()?;
@@ -51,6 +67,7 @@ impl ProvisioningService {
             pairing_id,
             operation_id,
             transcript_hash,
+            future_boards,
             &config,
             &self.node,
             &service_directory,

@@ -20,6 +20,7 @@ use meta_mesh_core::{
 use meta_mesh_native::{NativeBrowserConnection, NativeNode, NativeNodeOptions, NativeScopeHost};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, macros::format_description};
 
 use crate::{Config, ProvisioningCommit};
@@ -180,6 +181,7 @@ pub async fn provision_existing_identity(
     pairing_id: &str,
     operation_id: &str,
     transcript_hash: &str,
+    future_boards: bool,
     base: &Config,
     node: &NativeNode,
     service_directory: &Path,
@@ -283,7 +285,7 @@ pub async fn provision_existing_identity(
             "personId": person_id,
             "displayName": "mesh-lighthouse",
             "meshPeers": bundles,
-            "followOwner": false,
+            "followOwner": future_boards,
         }))?;
         let frame = machine.send_request(&request)?;
         let response = session.exchange(&frame, Duration::from_secs(600)).await?;
@@ -295,13 +297,19 @@ pub async fn provision_existing_identity(
                 return Err::<Vec<String>, BoxError>(reason.into());
             }
         };
-        let mut received: JoinResponse = serde_json::from_slice(&accepted)?;
+        let accepted_payload: Value = serde_json::from_slice(&accepted)?;
+        let original_snapshot_bytes = URL_SAFE_NO_PAD.decode(
+            accepted_payload["snapshot"]
+                .as_str()
+                .ok_or("Workspace join response is missing snapshot")?,
+        )?;
+        let mut received: JoinResponse = serde_json::from_value(accepted_payload)?;
         if received.grants.len() != scope_ids.len()
             || received.mesh_workspaces.len() != scope_ids.len()
         {
             return Err("Workspace invitation must contain every selected grant and scope".into());
         }
-        let snapshot_bytes = URL_SAFE_NO_PAD.decode(&received.snapshot)?;
+        let snapshot_bytes = original_snapshot_bytes.clone();
         let mut entries = decode_workspace_set(&snapshot_bytes, &scope_ids)?;
         let proof_cache = stage_root.join("proof-pages");
         create_private_directory(&proof_cache)?;
@@ -368,8 +376,18 @@ pub async fn provision_existing_identity(
                 &device_seed,
                 iroh_secret,
             )?;
-            scope.controller_person_id = Some(invite.issuer_person_id.clone());
+            scope.controller_person_id = future_boards.then(|| invite.issuer_person_id.clone());
             staged.push(scope);
+        }
+        let snapshot_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(&original_snapshot_bytes));
+        let receipt = serde_json::to_vec(&json!({
+            "kind": "lighthouse-provision-commit",
+            "version": 1,
+            "workspaceIds": scope_ids,
+            "snapshotHash": snapshot_hash,
+        }))?;
+        if receipt.len() > 4096 {
+            return Err("Keeper commit receipt exceeds size limit".into());
         }
         let commit = ProvisioningCommit {
             pairing_id: pairing_id.to_owned(),
@@ -377,14 +395,19 @@ pub async fn provision_existing_identity(
             transcript_hash: transcript_hash.to_owned(),
             invitation_id: invite.invitation_id.clone(),
             workspace_ids: scope_ids.clone(),
+            snapshot_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(&original_snapshot_bytes)),
+            future_boards,
         };
         if let Err(error) = activate(staged, commit) {
             return Err(error.into());
         }
         committed = true;
-        fs::remove_dir_all(&proof_cache)?;
-        let ack = machine.acknowledge_success(&snapshot)?;
-        session.exchange(&ack, Duration::from_secs(20)).await?;
+        let ack = machine.acknowledge_success(&receipt)?;
+        let ack_result = session.exchange(&ack, Duration::from_secs(20)).await;
+        // Cleanup is best-effort after the durable activation and ACK attempt.
+        // A stale cache must never turn a committed join into a failed ACK.
+        let _ = fs::remove_dir_all(&stage_root);
+        ack_result?;
         Ok(scope_ids.clone())
     }
     .await;

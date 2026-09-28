@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeMap,
+    fs,
+    io::Write,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -7,14 +9,17 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use match_lighthouse::{MatchLighthouseHost, MatchScopeStore};
 use meta_mesh_core::{
-    MeshHandshake, MeshPeerAdmission, WorkspaceItem, WorkspaceJoinInvitation,
-    WorkspaceWriteAuthorizationSnapshot,
+    DeviceCertificate, MeshHandshake, MeshPeerAdmission, PublicIdentity,
+    VerifyWorkspaceMemberOptions, WorkspaceItem, WorkspaceJoinInvitation, WorkspaceRole,
+    WorkspaceWriteAuthorizationSnapshot, public_key_id, verify_workspace_grant,
+    verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
-    FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
-    NativeScopeSnapshot,
+    FileScopeStore, NativeOwnerOfferSnapshot, NativeScopeCredential, NativeScopeHost,
+    NativeScopeServiceHost, NativeScopeSnapshot,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{Config, ProvisioningCommit, join};
 
@@ -165,7 +170,7 @@ impl KeeperHost {
     /// Caller sends the workspace-join ACK only after this returns success.
     pub(crate) fn activate_provisioned_scopes(
         &self,
-        staged: Vec<Config>,
+        mut staged: Vec<Config>,
         commit: ProvisioningCommit,
     ) -> Result<(), String> {
         let mut registry = self
@@ -206,19 +211,28 @@ impl KeeperHost {
                 return Err("Provisioned scope already exists".into());
             }
             let host = scope_host(scope)?;
-            if scope.controller_person_id.as_deref()
-                != Some(
-                    host.store
-                        .authority()?
-                        .expected_current_owner
-                        .person_id
-                        .as_str(),
-                )
+            let owner = host.store.authority()?.expected_current_owner.person_id;
+            if scope
+                .controller_person_id
+                .as_deref()
+                .is_some_and(|controller| controller != owner)
+                || (commit.future_boards
+                    && scope.controller_person_id.as_deref() != Some(owner.as_str()))
             {
                 return Err("Staged scope controller is not its verified current owner".into());
             }
+            if commit.future_boards
+                && next
+                    .controller_person_id
+                    .as_deref()
+                    .is_some_and(|current| current != owner)
+            {
+                return Err("Future-board following requires one verified owner identity".into());
+            }
+            if commit.future_boards {
+                next.controller_person_id = Some(owner);
+            }
             staged_hosts.push((scope.workspace_id.clone(), host));
-            next.additional_scopes.push(scope.clone());
         }
         let staged_ids = staged
             .iter()
@@ -227,12 +241,46 @@ impl KeeperHost {
         if commit.workspace_ids != staged_ids {
             return Err("Provisioning commit does not match staged scopes".into());
         }
+        let config_directory = registry
+            .config_path
+            .parent()
+            .ok_or("Invalid keeper registry path")?;
+        let moved = relocate_provisioned_scope_dirs(config_directory, &mut staged, &commit)?;
+        let relocated_hosts = staged
+            .iter()
+            .map(|scope| scope_host(scope).map(|host| (scope.workspace_id.clone(), host)))
+            .collect::<Result<Vec<_>, _>>();
+        staged_hosts = match relocated_hosts {
+            Ok(hosts) => hosts,
+            Err(error) => {
+                rollback_provisioned_scope_dirs(&moved);
+                return Err(error);
+            }
+        };
+        next.additional_scopes.extend(staged.iter().cloned());
         next.provisioning_commits.push(commit);
-        FileScopeStore::new(&registry.config_path).write_validated(
-            &serde_json::to_vec(&next).map_err(|error| error.to_string())?,
-            None,
-            |_, _| Ok(()),
-        )?;
+        let bytes = match serde_json::to_vec(&next) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                rollback_provisioned_scope_dirs(&moved);
+                return Err(error.to_string());
+            }
+        };
+        if let Err(error) =
+            FileScopeStore::new(&registry.config_path).write_validated(&bytes, None, |_, _| Ok(()))
+        {
+            rollback_provisioned_scope_dirs(&moved);
+            return Err(error);
+        }
+        for scope in &staged {
+            let _ = fs::remove_file(
+                scope
+                    .state_path
+                    .parent()
+                    .unwrap_or(config_directory)
+                    .join(".lighthouse-provisioning.json"),
+            );
+        }
         registry.config = next;
         registry.scopes.extend(staged_hosts);
         Ok(())
@@ -305,6 +353,130 @@ impl KeeperHost {
             crate::refresh_route(&mut scope.local_handshake, &seed, sequence)?;
         }
         Ok(())
+    }
+}
+
+fn relocate_provisioned_scope_dirs(
+    service_directory: &std::path::Path,
+    staged: &mut [Config],
+    commit: &ProvisioningCommit,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let scopes_root = service_directory.join("scopes");
+    if !scopes_root.exists() {
+        join::create_private_directory(&scopes_root).map_err(|error| error.to_string())?;
+    }
+    let mut moved = Vec::new();
+    for scope in staged {
+        let staging = scope
+            .state_path
+            .parent()
+            .ok_or("Invalid staged scope state path")?
+            .to_path_buf();
+        let key = URL_SAFE_NO_PAD.encode(Sha256::digest(scope.workspace_id.as_bytes()));
+        let destination = scopes_root.join(key);
+        if destination.exists() {
+            let marker_path = destination.join(".lighthouse-provisioning.json");
+            let marker_bytes = match fs::read(&marker_path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    rollback_provisioned_scope_dirs(&moved);
+                    return Err(
+                        "Persistent scope directory already exists without registry entry".into(),
+                    );
+                }
+            };
+            let marker: ScopeActivationMarker = match serde_json::from_slice(&marker_bytes) {
+                Ok(marker) => marker,
+                Err(_) => {
+                    rollback_provisioned_scope_dirs(&moved);
+                    return Err("Invalid orphaned scope activation marker".into());
+                }
+            };
+            if marker != ScopeActivationMarker::new(commit, &scope.workspace_id)
+                || !destination.join("state.json").is_file()
+            {
+                rollback_provisioned_scope_dirs(&moved);
+                return Err("Persistent scope directory belongs to another activation".into());
+            }
+            if let Err(error) = fs::remove_dir_all(&staging) {
+                rollback_provisioned_scope_dirs(&moved);
+                return Err(error.to_string());
+            }
+            scope.state_path = destination.join("state.json");
+            continue;
+        }
+        let marker =
+            match serde_json::to_vec(&ScopeActivationMarker::new(commit, &scope.workspace_id)) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    rollback_provisioned_scope_dirs(&moved);
+                    return Err(error.to_string());
+                }
+            };
+        if let Err(error) =
+            write_scope_marker(&staging.join(".lighthouse-provisioning.json"), &marker)
+        {
+            rollback_provisioned_scope_dirs(&moved);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&staging, &destination) {
+            rollback_provisioned_scope_dirs(&moved);
+            return Err(error.to_string());
+        }
+        moved.push((staging, destination.clone()));
+        scope.state_path = destination.join("state.json");
+    }
+    if let Err(error) = fs::File::open(&scopes_root).and_then(|directory| directory.sync_all()) {
+        rollback_provisioned_scope_dirs(&moved);
+        return Err(error.to_string());
+    }
+    Ok(moved)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ScopeActivationMarker {
+    pairing_id: String,
+    operation_id: String,
+    transcript_hash: String,
+    invitation_id: String,
+    snapshot_hash: String,
+    future_boards: bool,
+    workspace_id: String,
+}
+
+impl ScopeActivationMarker {
+    fn new(commit: &ProvisioningCommit, workspace_id: &str) -> Self {
+        Self {
+            pairing_id: commit.pairing_id.clone(),
+            operation_id: commit.operation_id.clone(),
+            transcript_hash: commit.transcript_hash.clone(),
+            invitation_id: commit.invitation_id.clone(),
+            snapshot_hash: commit.snapshot_hash.clone(),
+            future_boards: commit.future_boards,
+            workspace_id: workspace_id.to_owned(),
+        }
+    }
+}
+
+fn write_scope_marker(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+fn rollback_provisioned_scope_dirs(moved: &[(PathBuf, PathBuf)]) {
+    for (staging, destination) in moved.iter().rev() {
+        if std::fs::rename(destination, staging).is_err() {
+            let _ = std::fs::remove_dir_all(destination);
+        }
     }
 }
 
@@ -422,6 +594,141 @@ impl NativeScopeHost for KeeperScope {
     fn clear_proof_pages(&mut self) -> Result<(), String> {
         self.store.clear_proof_pages()
     }
+    fn prepare_owner_offer(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<NativeOwnerOfferSnapshot>, String> {
+        let value: Value =
+            serde_json::from_slice(bytes).map_err(|_| "Invalid keeper owner offer")?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let Some(controller) = registry.config.controller_person_id.as_deref() else {
+            return Ok(None);
+        };
+        if !registry
+            .config
+            .provisioning_commits
+            .iter()
+            .any(|commit| commit.future_boards)
+            || self.peer.person_id != controller
+            || value["controllerPersonId"].as_str() != Some(controller)
+            || value["version"] != 1
+        {
+            return Err(
+                "Keeper owner offer is not authorized by the approved future-board policy".into(),
+            );
+        }
+        let workspace_id = value["workspaceId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("Missing keeper scope id")?;
+        let envelope = &value["envelope"];
+        let workspace = &value["workspace"];
+        if envelope["workspaceId"] != workspace_id
+            || workspace["id"] != workspace_id
+            || envelope["ownerPersonId"] != controller
+        {
+            return Err("Keeper offer scope or owner mismatch".into());
+        }
+        if let Some(existing) = registry.scopes.get(workspace_id)
+            && existing.secret != envelope["transportSecret"].as_str().unwrap_or("")
+        {
+            return Err("Keeper scope conflicts with existing trust".into());
+        }
+        let owner_public_key = envelope["ownerPublicKey"]
+            .as_str()
+            .ok_or("Missing owner public key")?;
+        if public_key_id(owner_public_key)? != controller {
+            return Err("Keeper offer owner key mismatch".into());
+        }
+        let owner_certificates: Vec<DeviceCertificate> =
+            serde_json::from_value(envelope["ownerCertificates"].clone())
+                .map_err(|_| "Invalid owner certificates")?;
+        let owner = PublicIdentity {
+            person_id: controller.to_owned(),
+            public_key: owner_public_key.to_owned(),
+            display_name: String::new(),
+        };
+        let issuer = envelope["peers"]
+            .as_array()
+            .ok_or("Missing owner peers")?
+            .iter()
+            .find(|peer| {
+                peer.pointer("/advertisement/payload/deviceId")
+                    .and_then(Value::as_str)
+                    == Some(self.peer.device_id.as_str())
+            })
+            .ok_or("Keeper offer omits its authenticated owner device")?;
+        let verified_issuer = verify_workspace_member_bundle(
+            issuer.clone(),
+            VerifyWorkspaceMemberOptions {
+                workspace_id: Some(workspace_id.to_owned()),
+                owner_person_id: Some(controller.to_owned()),
+                owner_public_key: Some(owner_public_key.to_owned()),
+                owner_certificates: owner_certificates.clone(),
+                ..Default::default()
+            },
+            match_lighthouse::now_ms()?,
+        )?;
+        if verified_issuer.role != WorkspaceRole::Owner
+            || verified_issuer.payload.person_id != controller
+            || verified_issuer.payload.endpoint != self.peer.endpoint
+        {
+            return Err("Keeper offer issuer differs from authenticated owner".into());
+        }
+        let service_identity_seed: [u8; 32] = registry
+            .config
+            .identity_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Invalid keeper identity seed")?;
+        let service_person_id = public_key_id(&meta_mesh_core::public_key_from_seed(
+            &service_identity_seed,
+        )?)?;
+        let grant: meta_mesh_core::WorkspaceGrant = serde_json::from_value(value["grant"].clone())
+            .map_err(|_| "Missing signed keeper scope grant")?;
+        if verify_workspace_grant(
+            &grant,
+            workspace_id,
+            &service_person_id,
+            &owner,
+            &owner_certificates,
+        )? != WorkspaceRole::Visitor
+        {
+            return Err("Keeper offer grant does not authorize visitor access".into());
+        }
+        let manifest = workspace
+            .get("authorization")
+            .cloned()
+            .ok_or("Missing authorization manifest")?;
+        if manifest["kind"] != "workspace-authorization-manifest"
+            || manifest["version"] != 2
+            || manifest["workspaceId"] != workspace_id
+        {
+            return Ok(None);
+        }
+        let candidate = URL_SAFE_NO_PAD
+            .decode(
+                workspace["bytes"]
+                    .as_str()
+                    .ok_or("Missing owner document")?,
+            )
+            .map_err(|_| "Invalid owner document encoding")?;
+        let local = if let Some(scope) = registry.scopes.get_mut(workspace_id) {
+            scope.store.snapshot()?.document
+        } else {
+            automerge::AutoCommit::new().save()
+        };
+        Ok(Some(NativeOwnerOfferSnapshot {
+            workspace_id: workspace_id.to_owned(),
+            candidate,
+            local,
+            manifest,
+        }))
+    }
+
     fn snapshot(&mut self) -> Result<NativeScopeSnapshot, String> {
         self.store.snapshot()
     }

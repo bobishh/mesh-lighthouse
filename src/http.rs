@@ -376,7 +376,22 @@ async fn pairing_status(
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
+        .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    // Validate controller signature before consulting local durable activation.
+    pairings
+        .status(&id, request.clone())
+        .map_err(PairingResponseError)?;
+    if let Some(provisioner) = &state.provisioner {
+        if let Some(commit) = provisioner
+            .durable_commit(&id)
+            .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+        {
+            pairings
+                .complete_from_durable_activation(&id, &commit)
+                .map_err(PairingResponseError)?;
+        }
+    }
     Ok(Json(
         serde_json::to_value(
             pairings
@@ -408,6 +423,7 @@ async fn pairing_provision(
                     &provision.transcript_hash,
                     provision.invitation,
                     provision.scopes.clone(),
+                    provision.future_boards,
                 )
                 .await
             {
@@ -1676,6 +1692,7 @@ mod tests {
             "pairingId": pairing_id,
             "transcriptHash": transcript_hash,
             "servicePersonId": service_identity.person_id,
+            "futureBoards": false,
             "approvedScopes": [{"workspaceId":"disposable-board","mode":"replicate"}],
             "invitation": {}
         });

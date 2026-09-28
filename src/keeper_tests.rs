@@ -484,17 +484,21 @@ fn registry_write_failure_does_not_activate_or_leave_new_scope_storage() {
 #[test]
 fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
     let keeper = TestKeeper::new();
-    let staged = vec![
-        keeper.staged_scope("selected-board-a"),
-        keeper.staged_scope("selected-board-b"),
-    ];
     let commit = ProvisioningCommit {
         pairing_id: "pairing-test".into(),
         operation_id: "operation-test".into(),
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
+        snapshot_hash: "snapshot-test".into(),
+        future_boards: false,
     };
+    let mut orphaned = vec![keeper.staged_scope("selected-board-a")];
+    super::relocate_provisioned_scope_dirs(&keeper.directory, &mut orphaned, &commit).unwrap();
+    let staged = vec![
+        keeper.staged_scope("selected-board-a"),
+        keeper.staged_scope("selected-board-b"),
+    ];
 
     keeper
         .host
@@ -519,6 +523,36 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
         .activate_provisioned_scopes(staged, commit.clone())
         .unwrap();
     assert!(keeper.host.configuration().unwrap().provisioning_commits == vec![commit]);
+    let mut changed = keeper.host.configuration().unwrap().provisioning_commits[0].clone();
+    changed.snapshot_hash = "different-snapshot".into();
+    assert!(
+        keeper
+            .host
+            .activate_provisioned_scopes(vec![], changed)
+            .is_err()
+    );
+    let persisted = keeper.host.configuration().unwrap();
+    let added = persisted
+        .additional_scopes
+        .iter()
+        .find(|scope| scope.workspace_id == "selected-board-a")
+        .unwrap();
+    assert!(added.state_path.exists());
+    assert!(
+        !added
+            .state_path
+            .starts_with(keeper.directory.join(".provisioning-"))
+    );
+    for workspace_id in ["selected-board-a", "selected-board-b"] {
+        let _ = fs::remove_dir_all(
+            keeper
+                .directory
+                .join(format!(".provisioning-{workspace_id}")),
+        );
+    }
+    let reopened = KeeperHost::open(persisted, keeper.config_path.clone()).unwrap();
+    assert_eq!(reopened.scopes().unwrap().len(), 3);
+    assert!(reopened.primary_store().unwrap().0.snapshot().is_ok());
 }
 
 #[test]
@@ -533,6 +567,8 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
         transcript_hash: "transcript-test".into(),
         invitation_id: "invitation-test".into(),
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
+        snapshot_hash: "snapshot-test".into(),
+        future_boards: false,
     };
 
     assert!(

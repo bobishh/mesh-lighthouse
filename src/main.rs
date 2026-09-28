@@ -50,6 +50,10 @@ pub(crate) struct ProvisioningCommit {
     pub(crate) transcript_hash: String,
     pub(crate) invitation_id: String,
     pub(crate) workspace_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) snapshot_hash: String,
+    #[serde(default)]
+    pub(crate) future_boards: bool,
 }
 
 #[tokio::main]

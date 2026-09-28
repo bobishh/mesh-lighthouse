@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::ProvisioningCommit;
+
 pub const CONTROL_DOMAIN: &str = "MESH-LIGHTHOUSE/1";
 const MAX_AGE_SECONDS: u64 = 600;
 const MAX_SCOPES: usize = 16;
@@ -85,6 +87,7 @@ pub struct ProvisionRequest {
     pub scopes: Vec<String>,
     pub operation_id: String,
     pub transcript_hash: String,
+    pub future_boards: bool,
     pub should_run: bool,
 }
 
@@ -94,7 +97,7 @@ struct AdminSession {
     expires_at: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControllerRequest {
     pub identity: PublicIdentity,
@@ -202,11 +205,9 @@ impl PairingService {
         if body
             .pointer("/policy/futureBoards")
             .and_then(Value::as_bool)
-            != Some(false)
+            .is_none()
         {
-            return Err(PairingError::Invalid(
-                "Future-board authorization is not available",
-            ));
+            return Err(PairingError::Invalid("Missing future-board policy"));
         }
         let scopes = body
             .get("scopes")
@@ -424,6 +425,10 @@ impl PairingService {
             .get("body")
             .and_then(Value::as_object)
             .ok_or(PairingError::Invalid("Missing provisioning body"))?;
+        let future_boards = body
+            .get("futureBoards")
+            .and_then(Value::as_bool)
+            .ok_or(PairingError::Invalid("Missing future-board policy"))?;
         if body.get("pairingId").and_then(Value::as_str) != Some(id)
             || body.get("transcriptHash").and_then(Value::as_str).is_none()
             || body.get("servicePersonId").and_then(Value::as_str)
@@ -457,6 +462,16 @@ impl PairingService {
         }
         if record.controller_approved != Some(true) || record.operator_approved != Some(true) {
             return Err(PairingError::Forbidden);
+        }
+        if record
+            .offer
+            .pointer("/body/policy/futureBoards")
+            .and_then(Value::as_bool)
+            != Some(future_boards)
+        {
+            return Err(PairingError::Invalid(
+                "Provision future-board policy differs from signed offer",
+            ));
         }
         let transcript_hash = record.transcript_hash.clone();
         let invitation: WorkspaceJoinInvitation = serde_json::from_value(
@@ -538,6 +553,7 @@ impl PairingService {
                     scopes: scope_ids,
                     operation_id,
                     transcript_hash,
+                    future_boards,
                     should_run: false,
                 });
             }
@@ -573,6 +589,7 @@ impl PairingService {
             scopes: scope_ids,
             operation_id,
             transcript_hash,
+            future_boards,
             should_run,
         })
     }
@@ -618,6 +635,43 @@ impl PairingService {
             .lock()
             .map_err(|_| PairingError::Unavailable)?
             .remove(id);
+        Ok(())
+    }
+
+    pub fn complete_from_durable_activation(
+        &self,
+        id: &str,
+        commit: &ProvisioningCommit,
+    ) -> Result<(), PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        let mut next = state.clone();
+        let record = next.records.get_mut(id).ok_or(PairingError::NotFound)?;
+        let provisioning = record.provisioning.as_mut().ok_or(PairingError::Conflict)?;
+        let approved_future_boards = record
+            .offer
+            .pointer("/body/policy/futureBoards")
+            .and_then(Value::as_bool);
+        if commit.pairing_id != id
+            || commit.operation_id != provisioning.operation_id
+            || commit.transcript_hash != record.transcript_hash
+            || commit.future_boards != approved_future_boards.unwrap_or(false)
+            || commit.snapshot_hash.is_empty()
+            || commit.workspace_ids
+                != provisioning
+                    .scopes
+                    .iter()
+                    .map(|scope| scope.workspace_id.clone())
+                    .collect::<Vec<_>>()
+        {
+            return Err(PairingError::Conflict);
+        }
+        provisioning.status = "active".into();
+        for scope in &mut provisioning.scopes {
+            scope.status = "active".into();
+            scope.error = None;
+        }
+        self.persist(&next)?;
+        *state = next;
         Ok(())
     }
 
