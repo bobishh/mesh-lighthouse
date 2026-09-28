@@ -306,6 +306,7 @@ async fn replicate(
             let receiver = lifetime.receiver.as_mut().expect("receiver installed");
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut publish_failures = 0u32;
             let result: Result<(), String> = loop {
                 tokio::select! {
                 result = &mut *receiver => break Err(result.map_err(|error| error.to_string()).and_then(|result| result).err().unwrap_or_else(|| "Scope receiver ended".into())),
@@ -315,12 +316,30 @@ async fn replicate(
                             eprintln!("trace.sync event=publish.start connection={connection_id} workspace={} route={}", prefix(&workspace), prefix(&route));
                         }
                         if let Err(error) = publish_scope_to(&connection, &service, &workspace, &route, now_ms()?, Duration::from_secs(12)).await {
+                            if error.is_exchange_timeout() {
+                                publish_failures = publish_failures.saturating_add(1);
+                                let retry_delay = Duration::from_secs(match publish_failures {
+                                    1 => 1,
+                                    2 => 2,
+                                    3 => 5,
+                                    _ => 10,
+                                });
+                                if trace {
+                                    eprintln!("trace.sync event=publish.timeout connection={connection_id} workspace={} route={} stage={} elapsed_ms={} retry_ms={} session=retained", prefix(&workspace), prefix(&route), error.stage, publish_started.elapsed().as_millis(), retry_delay.as_millis());
+                                }
+                                // A timed-out RPC stream is isolated from the QUIC connection. Keep
+                                // the authenticated inbound receiver alive for heartbeats and
+                                // durable peer frames; retry only this route's publish stream.
+                                tick.reset_after(retry_delay);
+                                continue;
+                            }
                             lifetime.close_cause = "scope_publish_failed";
                             if trace {
-                                eprintln!("trace.sync event=publish.failed connection={connection_id} workspace={} route={} elapsed_ms={}", prefix(&workspace), prefix(&route), publish_started.elapsed().as_millis());
+                                eprintln!("trace.sync event=publish.failed connection={connection_id} workspace={} route={} stage={} elapsed_ms={} session=closing", prefix(&workspace), prefix(&route), error.stage, publish_started.elapsed().as_millis());
                             }
-                            break Err(error);
+                            break Err(error.to_string());
                         }
+                        publish_failures = 0;
                         if trace {
                             eprintln!("trace.sync event=publish.done connection={connection_id} workspace={} route={} elapsed_ms={}", prefix(&workspace), prefix(&route), publish_started.elapsed().as_millis());
                         }
