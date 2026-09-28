@@ -31,3 +31,8 @@ sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Signature admission runs on every live mesh frame. Keep scalar arithmetic
+# optimized in local debug runs so multiple scopes do not stall heartbeats.
+[profile.dev.package.ed25519-compact]
+opt-level = 3

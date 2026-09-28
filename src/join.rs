@@ -38,9 +38,6 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
         ScopedInvitation::WorkspaceJoin(invite) => invite,
         _ => return Err("Lighthouse requires a workspace invitation".into()),
     };
-    if invite.workspaces.len() != 1 {
-        return Err("Lighthouse accepts one workspace per invitation".into());
-    }
     let directory_existed = directory.exists();
     if directory_existed
         && (directory.join("config.json").exists() || directory.join("state.json").exists())
@@ -76,24 +73,32 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
         ..NativeNodeOptions::default()
     })
     .await?;
-    let bundle = guest_bundle(
-        &invite.workspace_id,
-        &person_id,
-        &device_id,
-        &identity_public_key,
-        &certificate,
-        &device_seed,
-        &node.endpoint_id().to_string(),
-    )?;
+    let bundles = invite
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            guest_bundle(
+                &workspace.id,
+                &person_id,
+                &device_id,
+                &identity_public_key,
+                &certificate,
+                &device_seed,
+                &node.endpoint_id().to_string(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let owner = EndpointAddr::new(owner_endpoint);
     let session = node.connect_browser(owner, Duration::from_secs(15)).await?;
+    let mut created_scope_directories = Vec::new();
     let result = async {
         let mut machine = WorkspaceJoinHandshake::guest(&invite.secret)?;
         let request = serde_json::to_vec(&json!({
             "invitationId": invite.invitation_id,
             "personId": person_id,
             "displayName": "mesh-lighthouse",
-            "meshPeers": [bundle],
+            "meshPeers": bundles,
+            "followOwner": true,
         }))?;
         let frame = machine.send_request(&request)?;
         let response = session.exchange(&frame, Duration::from_secs(600)).await?;
@@ -107,17 +112,38 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
         };
         create_private_directory(&directory)?;
         let directory = fs::canonicalize(&directory)?;
-        let config = prepare_config(
-            &invite,
-            &accepted,
-            &directory,
-            &person_id,
-            &device_id,
-            &bundle,
-            identity_seed,
-            &device_seed,
-            iroh_secret,
-        )?;
+        let received: JoinResponse = serde_json::from_slice(&accepted)?;
+        let ids = invite.workspaces.iter().map(|workspace| workspace.id.clone()).collect::<Vec<_>>();
+        if received.grants.len() != ids.len() || received.mesh_workspaces.len() != ids.len() {
+            return Err("Workspace invitation must contain every selected grant and scope".into());
+        }
+        let entries = decode_workspace_set(&URL_SAFE_NO_PAD.decode(&received.snapshot)?, &ids)?;
+        let mut configs = Vec::new();
+        for (index, workspace) in invite.workspaces.iter().enumerate() {
+            let mut scoped_invite = invite.clone();
+            scoped_invite.workspace_id = workspace.id.clone();
+            scoped_invite.workspaces = vec![workspace.clone()];
+            let grant = received.grants.iter().find(|grant| grant.payload.workspace_id == workspace.id)
+                .ok_or("Missing invited scope grant")?;
+            let envelope = received.mesh_workspaces.iter().find(|envelope| envelope["workspaceId"] == workspace.id)
+                .ok_or("Missing invited scope")?;
+            let entry = entries.iter().find(|entry| entry.id == workspace.id).ok_or("Missing invited document")?;
+            let scoped_response = serde_json::to_vec(&json!({ "grants": [grant],
+                "meshWorkspaces": [envelope], "snapshot": URL_SAFE_NO_PAD.encode(serde_json::to_vec(&vec![entry])?) }))?;
+            let path = if index == 0 { directory.clone() } else {
+                let path = directory.join(format!("scope-{:032x}", rand::random::<u128>()));
+                create_private_directory(&path)?;
+                created_scope_directories.push(path.clone());
+                path
+            };
+            configs.push(prepare_config(&scoped_invite, &scoped_response, &path, &person_id, &device_id,
+                &bundles[index], identity_seed, &device_seed, iroh_secret)?);
+        }
+        let mut config = configs.remove(0);
+        config.additional_scopes = configs;
+        let owner_connection = serde_json::from_slice::<Value>(&accepted)?;
+        config.controller_person_id = owner_connection.pointer("/ownerConnection/controllerPersonId")
+            .and_then(Value::as_str).filter(|person| *person == invite.issuer_person_id).map(str::to_owned);
         save_config(&directory, &config)?;
         let ack = machine.acknowledge_success(
             &URL_SAFE_NO_PAD.decode(serde_json::from_slice::<JoinResponse>(&accepted)?.snapshot)?,
@@ -129,6 +155,9 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
     session.close();
     node.close().await?;
     if result.is_err() && !directory.join("config.json").exists() {
+        for path in created_scope_directories {
+            let _ = fs::remove_dir_all(path);
+        }
         cleanup_failed_join(&directory, directory_existed);
     }
     let config = result?;
@@ -141,7 +170,7 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
     Ok(())
 }
 
-fn guest_bundle(
+pub(crate) fn guest_bundle(
     workspace_id: &str,
     person_id: &str,
     device_id: &str,
@@ -176,7 +205,7 @@ fn guest_bundle(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_config(
+pub(crate) fn prepare_config(
     invite: &meta_mesh_core::WorkspaceJoinInvitation,
     response: &[u8],
     directory: &Path,
@@ -336,10 +365,12 @@ fn prepare_config(
         initial_state: state,
         identity_seed: identity_seed.to_vec(),
         device_seed: device_seed.to_vec(),
+        additional_scopes: Vec::new(),
+        controller_person_id: None,
     })
 }
 
-fn save_config(directory: &PathBuf, config: &Config) -> Result<(), BoxError> {
+pub(crate) fn save_config(directory: &PathBuf, config: &Config) -> Result<(), BoxError> {
     let path = directory.join("config.json");
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -355,7 +386,7 @@ fn save_config(directory: &PathBuf, config: &Config) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn create_private_directory(directory: &PathBuf) -> Result<(), BoxError> {
+pub(crate) fn create_private_directory(directory: &PathBuf) -> Result<(), BoxError> {
     match fs::create_dir(directory) {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

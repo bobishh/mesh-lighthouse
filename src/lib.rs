@@ -41,6 +41,15 @@ fn empty_chat() -> Value {
 struct Inner {
     state: MatchLighthouseState,
     file: FileScopeStore,
+    authority_revision: u64,
+    authority_cache: Option<CachedAuthority>,
+}
+
+#[derive(Clone)]
+struct CachedAuthority {
+    revision: u64,
+    verified_at_ms: i128,
+    snapshot: WorkspaceWriteAuthorizationSnapshot,
 }
 
 #[derive(Clone)]
@@ -74,14 +83,19 @@ impl MatchScopeStore {
         let store = Self {
             workspace_id,
             genesis_person_id,
-            inner: Arc::new(Mutex::new(Inner { state, file })),
+            inner: Arc::new(Mutex::new(Inner {
+                state,
+                file,
+                authority_revision: 0,
+                authority_cache: None,
+            })),
         };
         {
-            let guard = store
+            let mut guard = store
                 .inner
                 .lock()
                 .map_err(|_| "Lighthouse state lock poisoned")?;
-            store.authority_for(&guard.state)?;
+            let snapshot = store.authority_cached(&mut guard)?;
             let mut current = AutoCommit::load(&guard.state.document)
                 .map_err(|error| format!("Invalid lighthouse document: {error}"))?;
             let hashes = current
@@ -89,7 +103,6 @@ impl MatchScopeStore {
                 .iter()
                 .map(|change| change.hash().to_string())
                 .collect::<Vec<_>>();
-            let (snapshot, _) = store.authority_for(&guard.state)?;
             admit_match_candidate(
                 None,
                 &guard.state.document,
@@ -106,20 +119,20 @@ impl MatchScopeStore {
     }
 
     pub fn authority(&self) -> Result<WorkspaceWriteAuthorizationSnapshot, String> {
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
-        self.authority_for(&guard.state)
-            .map(|(snapshot, _)| snapshot)
+        self.authority_cached(&mut guard)
     }
 
     pub fn authorized_peer_endpoints(&self) -> Result<Vec<String>, String> {
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
-        let mesh = verified_mesh_for(self, &guard.state)?;
+        let authority = self.authority_cached(&mut guard)?;
+        let mesh = verified_mesh_for(&guard.state, &authority)?;
         Ok(mesh
             .get("peers")
             .and_then(Value::as_array)
@@ -402,9 +415,31 @@ impl MatchScopeStore {
         Ok(record_id)
     }
 
-    fn authority_for(
+    fn authority_cached(
+        &self,
+        inner: &mut Inner,
+    ) -> Result<WorkspaceWriteAuthorizationSnapshot, String> {
+        let now = now_ms()?;
+        if let Some(cached) = &inner.authority_cache {
+            // Authority records have no expiry. They can become valid as wall
+            // time advances, but a backwards clock jump must force revalidation.
+            if cached.revision == inner.authority_revision && now >= cached.verified_at_ms {
+                return Ok(cached.snapshot.clone());
+            }
+        }
+        let (snapshot, _) = self.authority_for_at(&inner.state, now)?;
+        inner.authority_cache = Some(CachedAuthority {
+            revision: inner.authority_revision,
+            verified_at_ms: now,
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
+    fn authority_for_at(
         &self,
         state: &MatchLighthouseState,
+        now: i128,
     ) -> Result<(WorkspaceWriteAuthorizationSnapshot, Value), String> {
         let evidence = state
             .authorization
@@ -421,7 +456,7 @@ impl MatchScopeStore {
             None,
             records,
             &self.genesis_person_id,
-            now_ms()?,
+            now,
         )?;
         if snapshot.workspace_id != self.workspace_id {
             return Err("Lighthouse workspace does not match document".into());
@@ -430,7 +465,13 @@ impl MatchScopeStore {
     }
 
     fn save(&self, guard: &mut Inner, next: MatchLighthouseState) -> Result<(), String> {
+        let authority_changed = guard.state.document != next.document
+            || guard.state.authorization != next.authorization;
         write_state(&guard.file, &next)?;
+        if authority_changed {
+            guard.authority_revision = guard.authority_revision.wrapping_add(1);
+            guard.authority_cache = None;
+        }
         guard.state = next;
         Ok(())
     }
@@ -487,10 +528,9 @@ fn put_text(
 }
 
 fn verified_mesh_for(
-    store: &MatchScopeStore,
     state: &MatchLighthouseState,
+    authority: &WorkspaceWriteAuthorizationSnapshot,
 ) -> Result<Value, String> {
-    let (authority, _) = store.authority_for(state)?;
     let existing = state
         .mesh
         .as_ref()
@@ -498,21 +538,22 @@ fn verified_mesh_for(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let peers = merge_verified_peer_catalog(existing, &[], &authority, now_ms()?)?;
+    let peers = merge_verified_peer_catalog(existing, &[], authority, now_ms()?)?;
     Ok(json!({"version": 1, "peers": peers, "revocations": []}))
 }
 
 impl NativeScopeHost for MatchScopeStore {
     fn snapshot(&mut self) -> Result<NativeScopeSnapshot, String> {
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
+        let authority = self.authority_cached(&mut guard)?;
         Ok(NativeScopeSnapshot {
             document: guard.state.document.clone(),
             authorization: Some(guard.state.authorization.clone()),
             chat: Some(guard.state.chat.clone()),
-            mesh: Some(verified_mesh_for(self, &guard.state)?),
+            mesh: Some(verified_mesh_for(&guard.state, &authority)?),
         })
     }
 
@@ -638,7 +679,7 @@ impl NativeScopeHost for MatchScopeStore {
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
-        let (authority, _) = self.authority_for(&guard.state)?;
+        let authority = self.authority_cached(&mut guard)?;
         let existing = guard
             .state
             .mesh
@@ -903,6 +944,12 @@ mod tests {
             initial.clone(),
         )
         .unwrap();
+        assert_eq!(
+            store.inner.lock().unwrap().authority_revision,
+            0,
+            "opening a verified state starts at its initial authority revision"
+        );
+        assert!(store.inner.lock().unwrap().authority_cache.is_some());
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
         let new_hash = document.get_heads()[0].to_string();
@@ -918,6 +965,8 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.snapshot().unwrap().document, baseline);
+        assert_eq!(store.inner.lock().unwrap().authority_revision, 0);
+        assert!(store.inner.lock().unwrap().authority_cache.is_some());
         store
             .persist_document(
                 &candidate,
@@ -925,6 +974,23 @@ mod tests {
                 &[document.get_heads()[0].to_string()],
             )
             .unwrap();
+        {
+            let inner = store.inner.lock().unwrap();
+            assert_eq!(inner.authority_revision, 1);
+            assert!(inner.authority_cache.is_none());
+        }
+        assert_eq!(store.authority().unwrap().document, candidate);
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .authority_cache
+                .as_ref()
+                .unwrap()
+                .revision,
+            1
+        );
         assert!(
             store
                 .persist_document(&baseline, Some(&initial.authorization), &[])
@@ -948,6 +1014,8 @@ mod tests {
         let message_id = store
             .create_chat_message(&peer, &[2; 32], "intake-test", "New lead")
             .unwrap();
+        assert_eq!(store.inner.lock().unwrap().authority_revision, 1);
+        assert!(store.inner.lock().unwrap().authority_cache.is_some());
         let chat = store.snapshot().unwrap().chat.unwrap();
         assert_eq!(
             chat.pointer("/messages/0/signed/payload/id")
