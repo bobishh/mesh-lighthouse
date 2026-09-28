@@ -13,8 +13,8 @@ use match_authority::{admit_match_candidate, prepare_match_write_authority};
 use meta_mesh_core::{
     DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
     WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot,
-    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
-    verify_workspace_member_bundle,
+    authorization_admission_bundle, authorization_records, merge_verified_peer_catalog,
+    sign_json_envelope, validate_mesh_catalog, verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
     FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
@@ -22,6 +22,9 @@ use meta_mesh_native::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod proof_cache;
+use proof_cache::ProofPageCache;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +60,7 @@ pub struct MatchScopeStore {
     workspace_id: String,
     genesis_person_id: String,
     inner: Arc<Mutex<Inner>>,
+    proof_cache: ProofPageCache,
 }
 
 pub struct LeadDraft<'a> {
@@ -74,15 +78,28 @@ impl MatchScopeStore {
         path: PathBuf,
         initial: MatchLighthouseState,
     ) -> Result<Self, String> {
+        let proof_cache = ProofPageCache::new(&path);
         let file = FileScopeStore::new(path);
-        let state = match file.read()? {
-            Some(bytes) => serde_json::from_slice::<MatchLighthouseState>(&bytes)
+        let stored = file.read()?;
+        let mut state = match stored.as_ref() {
+            Some(bytes) => serde_json::from_slice::<MatchLighthouseState>(bytes)
                 .map_err(|error| format!("Invalid lighthouse state: {error}"))?,
             None => initial,
         };
+        // A restored aggregate is storage, not a legacy network frame. New
+        // enrollment evidence still passes its original wire format limits.
+        let admission = if stored.is_some() {
+            authorization_admission_bundle(&state.authorization)?
+        } else {
+            state.authorization.clone()
+        };
+        let records = authorization_records(&admission)?;
+        state.authorization = json!({"version": 1, "records": records,
+            "authority": admission.get("authority")});
         let store = Self {
             workspace_id,
             genesis_person_id,
+            proof_cache,
             inner: Arc::new(Mutex::new(Inner {
                 state,
                 file,
@@ -103,11 +120,12 @@ impl MatchScopeStore {
                 .iter()
                 .map(|change| change.hash().to_string())
                 .collect::<Vec<_>>();
+            let admission = authorization_admission_bundle(&guard.state.authorization)?;
             admit_match_candidate(
                 None,
                 &guard.state.document,
                 &hashes,
-                Some(&guard.state.authorization),
+                Some(&admission),
                 snapshot,
                 now_ms()?,
             )?;
@@ -299,6 +317,7 @@ impl MatchScopeStore {
             .push(json!({"signed":signed,"publicKey":member.public_key,"certificates":member.certificates,
                 "grant":member.grant,"ownerPublicKey":member.owner_public_key,
                 "ownerCertificates":member.owner_certificates}));
+        let proof = authorization_admission_bundle(&proof)?;
         self.persist_document(&document.save(), Some(&proof), &[hash])?;
         Ok(id)
     }
@@ -543,6 +562,18 @@ fn verified_mesh_for(
 }
 
 impl NativeScopeHost for MatchScopeStore {
+    fn read_proof_page(&mut self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.proof_cache.read(key)
+    }
+
+    fn write_proof_page(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
+        self.proof_cache.write(key, payload)
+    }
+
+    fn clear_proof_pages(&mut self) -> Result<(), String> {
+        self.proof_cache.clear()
+    }
+
     fn snapshot(&mut self) -> Result<NativeScopeSnapshot, String> {
         let mut guard = self
             .inner
@@ -570,16 +601,14 @@ impl NativeScopeHost for MatchScopeStore {
         let incoming = proof
             .and_then(|value| value.get("authority"))
             .ok_or("Missing incoming Match authority")?;
-        let incoming_records = proof
-            .and_then(|value| value.get("records"))
-            .and_then(Value::as_array)
-            .ok_or("Missing incoming Match write authorizations")?;
+        let incoming_records =
+            authorization_records(proof.ok_or("Missing incoming Match write authorizations")?)?;
         let known = guard.state.authorization.get("authority");
         let (snapshot, merged) = prepare_match_write_authority(
             candidate,
             incoming,
             known,
-            incoming_records,
+            &incoming_records,
             &self.genesis_person_id,
             now_ms()?,
         )?;
@@ -611,15 +640,12 @@ impl NativeScopeHost for MatchScopeStore {
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
         let incoming_evidence = incoming.get("authority").ok_or("Missing Match authority")?;
-        let incoming_records = incoming
-            .get("records")
-            .and_then(Value::as_array)
-            .ok_or("Missing Match write authorizations")?;
+        let incoming_records = authorization_records(incoming)?;
         let (snapshot, merged) = prepare_match_write_authority(
             &guard.state.document,
             incoming_evidence,
             guard.state.authorization.get("authority"),
-            incoming_records,
+            &incoming_records,
             &self.genesis_person_id,
             now_ms()?,
         )?;
@@ -937,11 +963,28 @@ mod tests {
             std::process::id(),
             now_ms().unwrap()
         ));
+        let mut oversized_initial = initial.clone();
+        oversized_initial.authorization["records"] =
+            json!(vec![initial.authorization["records"][0].clone(); 20_001]);
+        assert!(
+            MatchScopeStore::open(
+                "board".into(),
+                person_id.clone(),
+                path.clone(),
+                oversized_initial,
+            )
+            .is_err(),
+            "new enrollment cannot bypass legacy wire limits"
+        );
+        assert!(!path.exists());
+        let mut paged_initial = initial.clone();
+        paged_initial.authorization =
+            authorization_admission_bundle(&initial.authorization).unwrap();
         let mut store = MatchScopeStore::open(
             "board".into(),
             person_id.clone(),
             path.clone(),
-            initial.clone(),
+            paged_initial,
         )
         .unwrap();
         assert_eq!(
@@ -950,6 +993,16 @@ mod tests {
             "opening a verified state starts at its initial authority revision"
         );
         assert!(store.inner.lock().unwrap().authority_cache.is_some());
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .authorization
+                .unwrap()
+                .get("records")
+                .is_some(),
+            "paged enrollment normalizes to internal aggregate storage"
+        );
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
         let new_hash = document.get_heads()[0].to_string();
@@ -967,10 +1020,25 @@ mod tests {
         assert_eq!(store.snapshot().unwrap().document, baseline);
         assert_eq!(store.inner.lock().unwrap().authority_revision, 0);
         assert!(store.inner.lock().unwrap().authority_cache.is_some());
+        let paged_proof =
+            authorization_admission_bundle(&proof_for(vec![new_hash.clone()])).unwrap();
+        let mut forged_proof = paged_proof.clone();
+        forged_proof["pages"][0][0]["signed"]["signature"] = json!("invalid-signature");
+        assert!(
+            store
+                .persist_document(
+                    &candidate,
+                    Some(&forged_proof),
+                    std::slice::from_ref(&new_hash)
+                )
+                .is_err()
+        );
+        assert_eq!(store.snapshot().unwrap().document, baseline);
+        assert_eq!(store.inner.lock().unwrap().authority_revision, 0);
         store
             .persist_document(
                 &candidate,
-                Some(&proof_for(vec![new_hash])),
+                Some(&paged_proof),
                 &[document.get_heads()[0].to_string()],
             )
             .unwrap();

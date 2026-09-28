@@ -312,6 +312,15 @@ pub(crate) struct KeeperScope {
 }
 
 impl NativeScopeHost for KeeperScope {
+    fn read_proof_page(&mut self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.store.read_proof_page(key)
+    }
+    fn write_proof_page(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
+        self.store.write_proof_page(key, payload)
+    }
+    fn clear_proof_pages(&mut self) -> Result<(), String> {
+        self.store.clear_proof_pages()
+    }
     fn snapshot(&mut self) -> Result<NativeScopeSnapshot, String> {
         self.store.snapshot()
     }
