@@ -151,6 +151,54 @@ impl KeeperHost {
             .clone())
     }
 
+    pub(crate) fn admin_overview(&self) -> Result<Value, String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let mut boards = Vec::with_capacity(registry.scopes.len());
+        let peer = serde_json::to_value(&registry.config.local_handshake.peer)
+            .map_err(|error| error.to_string())?;
+        for (workspace_id, scope) in &registry.scopes {
+            let (title, heads) = scope.store.document_overview()?;
+            let config = std::iter::once(&registry.config)
+                .chain(registry.config.additional_scopes.iter())
+                .find(|config| config.workspace_id == *workspace_id)
+                .ok_or("Missing keeper board configuration")?;
+            let modified = fs::metadata(&config.state_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs());
+            let title = title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if *workspace_id == registry.config.workspace_id {
+                        "Primary workspace".into()
+                    } else {
+                        format!("Board {}", workspace_id.get(..8).unwrap_or(workspace_id))
+                    }
+                });
+            boards.push(json!({
+                "workspaceId": workspace_id,
+                "title": title,
+                "isPrimary": *workspace_id == registry.config.workspace_id,
+                "heads": heads,
+                "peerCount": scope.store.authorized_peer_endpoints()?.len(),
+                "lastSavedAt": modified,
+            }));
+        }
+        boards.sort_by_key(|board| !board["isPrimary"].as_bool().unwrap_or(false));
+        Ok(json!({
+            "keeper": {
+                "displayName": peer.pointer("/advertisement/payload/deviceName").and_then(Value::as_str).unwrap_or("Lighthouse"),
+                "personId": peer.pointer("/advertisement/payload/personId").and_then(Value::as_str).unwrap_or_default(),
+                "deviceId": registry.config.device_id,
+                "boards": boards,
+            }
+        }))
+    }
+
     pub(crate) fn provisioning_commit(
         &self,
         pairing_id: &str,

@@ -120,7 +120,11 @@ fn signed_state(owner: &Identity, workspace_id: &str) -> MatchLighthouseState {
     document
         .put(ROOT, "ownerPersonId", owner.person_id.clone())
         .unwrap();
-    document.put(ROOT, "title", workspace_id).unwrap();
+    // Automerge JS 3 uses Text objects for ordinary string properties.
+    let title = document
+        .put_object(ROOT, "title", automerge::ObjType::Text)
+        .unwrap();
+    document.splice_text(&title, 0, 0, workspace_id).unwrap();
     let bytes = document.save();
     let hashes = document
         .get_changes(&[])
@@ -323,6 +327,141 @@ impl Drop for TestKeeper {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.directory);
     }
+}
+
+#[tokio::test]
+async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_jev_without_invites()
+{
+    use crate::{http, pairing::PairingService};
+    use axum::http::{StatusCode, header};
+    let keeper = TestKeeper::new();
+    let staged = keeper.staged_scope("second-board");
+    keeper
+        .host
+        .activate_provisioned_scopes(
+            vec![staged],
+            ProvisioningCommit {
+                pairing_id: "overview-pairing".into(),
+                operation_id: "overview-operation".into(),
+                transcript_hash: "overview-transcript".into(),
+                invitation_id: "overview-invitation".into(),
+                workspace_ids: vec!["second-board".into()],
+                snapshot_hash: "overview-snapshot".into(),
+                future_boards: false,
+            },
+        )
+        .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let admin_secret = "test-operator-token-that-is-long-enough";
+    let pairings = PairingService::open(
+        keeper.directory.join("pairings"),
+        &config.local_handshake.peer,
+        "http://127.0.0.1:4283".into(),
+        keeper.keeper.device_seed,
+        admin_secret.into(),
+    )
+    .unwrap();
+    let discovery =
+        http::Discovery::from_peer(&config.local_handshake.peer, "http://127.0.0.1:4283")
+            .unwrap()
+            .with_pairings(pairings);
+    let app = http::operator_test_router(&keeper.directory, discovery, keeper.host.clone()).await;
+    fs::write(
+        keeper.directory.join("inbox/pending.json"),
+        "private incoming lead content",
+    )
+    .unwrap();
+    for (index, status) in ["awaiting_mesh", "chat_queued", "card_created_v2"]
+        .iter()
+        .enumerate()
+    {
+        fs::write(keeper.directory.join(format!("results/{index}.json")), json!({
+            "assessment": {"choice":"qualified", "confidence":0.9,"probabilities":{}, "model":"test-model"},
+            "status":status,"company":"private employer", "role":"private lead role",
+        }).to_string()).unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("{origin}/admin/api/overview");
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let login = client
+        .post(format!("{origin}/admin/api/session"))
+        .json(&json!({"secret":admin_secret}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let response = client
+        .get(&url)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let overview = response.json::<Value>().await.unwrap();
+    let boards = overview["keeper"]["boards"].as_array().unwrap();
+    assert_eq!(boards.len(), 2);
+    assert_eq!(boards[0]["workspaceId"], "primary-board");
+    assert_eq!(boards[0]["title"], "primary-board");
+    assert_eq!(boards[0]["isPrimary"], true);
+    assert_eq!(boards[1]["workspaceId"], "second-board");
+    assert!(
+        boards
+            .iter()
+            .all(|board| !board["heads"].as_array().unwrap().is_empty())
+    );
+    assert_eq!(overview["keeper"]["personId"], keeper.keeper.person_id);
+    assert_eq!(overview["keeper"]["deviceId"], keeper.keeper.device_id);
+    assert_eq!(overview["replication"]["state"], "idle");
+    assert_eq!(overview["replication"]["activePeers"], 0);
+    assert_eq!(
+        overview["triggers"][0]["targetWorkspaceId"],
+        "primary-board"
+    );
+    assert_eq!(overview["triggers"][0]["pendingCount"], 1);
+    assert!(overview["triggers"][0]["lastResultAt"].as_u64().is_some());
+    assert_eq!(
+        overview["triggers"][0]["outcomes"],
+        json!({"awaitingMesh":1,"chatQueued":1,"cardCreated":1})
+    );
+    let body = overview.to_string();
+    for private in [
+        admin_secret,
+        "private incoming lead content",
+        "private employer",
+        "transport-secret",
+        "identitySeed",
+        "deviceSeed",
+        "irohSecret",
+    ] {
+        assert!(!body.contains(private));
+    }
+    // Missing durable result storage is a sanitized failure, never an empty
+    // success that hides lost intake data or leaked filesystem diagnostics.
+    fs::remove_dir_all(keeper.directory.join("results")).unwrap();
+    let failed = client
+        .get(&url)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let failure = failed.text().await.unwrap();
+    assert!(!failure.contains(keeper.directory.to_str().unwrap()));
+    assert!(!failure.contains("private employer"));
+    server.abort();
 }
 
 #[test]

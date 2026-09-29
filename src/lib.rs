@@ -144,6 +144,39 @@ impl MatchScopeStore {
         self.authority_cached(&mut guard)
     }
 
+    /// Administrative metadata only: never clone authorization or chat payloads,
+    /// or serialize CRDT entities to obtain a title and heads.
+    pub fn document_overview(&self) -> Result<(Option<String>, Vec<String>), String> {
+        let bytes = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?
+            .state
+            .document
+            .clone();
+        let mut document = AutoCommit::load(&bytes).map_err(|_| "Invalid Match document")?;
+        let title = match document
+            .get(ROOT, "title")
+            .map_err(|_| "Invalid Match document title")?
+        {
+            Some((automerge::Value::Object(ObjType::Text), object)) => Some(
+                document
+                    .text(object)
+                    .map_err(|_| "Invalid Match document title")?,
+            ),
+            Some((value, _)) => value.as_str().map(str::to_owned),
+            None => None,
+        };
+        Ok((
+            title,
+            document
+                .get_heads()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ))
+    }
+
     pub fn authorized_peer_endpoints(&self) -> Result<Vec<String>, String> {
         let mut guard = self
             .inner

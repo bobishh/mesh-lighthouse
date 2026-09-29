@@ -9,12 +9,9 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
-    extract::Path as AxumPath,
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    Json,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -26,13 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tower_http::cors::CorsLayer;
 
 use crate::pairing::{
     ControllerRequest, LoginRequest, PairingError, PairingService, ProvisionedScope,
     SessionResponse,
 };
 use crate::provisioning::ProvisioningService;
+use crate::{keeper::KeeperHost, replication::RuntimeOverview};
 
 const MAX_PENDING: usize = 100;
 const MAX_CONCURRENT_INGEST: usize = 8;
@@ -54,7 +51,7 @@ pub struct LeadRequest {
 pub type LeadSender = mpsc::Sender<LeadRequest>;
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     inbox: Inbox,
     captcha: Captcha,
     ingest_slots: Arc<Semaphore>,
@@ -62,6 +59,8 @@ struct AppState {
     pairings: Option<PairingService>,
     provisioner: Option<Arc<ProvisioningService>>,
     cors_origins: Arc<Vec<String>>,
+    keeper: Option<KeeperHost>,
+    replication: RuntimeOverview,
 }
 
 #[derive(Clone)]
@@ -167,7 +166,7 @@ enum SaveInboxError {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct IncomingMessage {
+pub(crate) struct IncomingMessage {
     message: String,
     #[serde(default)]
     contact: String,
@@ -191,7 +190,7 @@ struct CaptchaPayload {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Challenge {
+pub(crate) struct Challenge {
     prompt: String,
     token: String,
 }
@@ -250,6 +249,8 @@ pub async fn serve(
     address: SocketAddr,
     lead_sender: Option<LeadSender>,
     discovery: Option<Discovery>,
+    keeper: Option<KeeperHost>,
+    replication: RuntimeOverview,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inbox = directory.join("inbox");
     let results = directory.join("results");
@@ -297,44 +298,60 @@ pub async fn serve(
         pairings,
         provisioner,
         cors_origins: Arc::new(cors_origins),
+        keeper,
+        replication,
     };
     let processing_inbox = state.inbox.clone();
     tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
-    let app = http_app(state, allowed_origins);
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Lighthouse HTTP listening on {address}");
-    axum::serve(listener, app).await?;
+    crate::app::serve(state, address, allowed_origins).await?;
     Ok(())
 }
 
-fn http_app(state: AppState, allowed_origins: Vec<HeaderValue>) -> Router {
-    Router::new()
-        .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
-        .route("/.well-known/mesh-lighthouse", get(discover))
-        .route("/v1/pairings", post(create_pairing))
-        .route("/v1/pairings/{id}/decision", post(pairing_decision))
-        .route("/v1/pairings/{id}/status", post(pairing_status))
-        .route("/v1/pairings/{id}/provision", post(pairing_provision))
-        .route("/admin", get(admin_page))
-        .route("/admin/", get(admin_page))
-        .route("/admin/api/session", post(admin_login))
-        .route("/admin/api/pairings", get(admin_list))
-        .route("/admin/api/pairings/{id}/decision", post(admin_decision))
-        .route("/challenge", get(challenge))
-        .route("/ingest", post(ingest))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(allowed_origins)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers([header::CONTENT_TYPE]),
-        )
-        .with_state(state)
+#[cfg(test)]
+async fn http_app(
+    state: AppState,
+    allowed_origins: Vec<HeaderValue>,
+) -> loco_rs::Result<axum::Router> {
+    crate::app::router(state, allowed_origins).await
 }
 
-async fn create_pairing(
-    State(state): State<AppState>,
-    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+#[cfg(test)]
+pub(crate) async fn operator_test_router(
+    directory: &Path,
+    discovery: Discovery,
+    keeper: KeeperHost,
+) -> axum::Router {
+    for name in ["inbox", "results", "captcha-used"] {
+        fs::create_dir_all(directory.join(name)).unwrap();
+    }
+    http_app(
+        AppState {
+            inbox: Inbox {
+                directory: Arc::new(directory.join("inbox")),
+                results: Arc::new(directory.join("results")),
+                write_lock: Arc::new(Mutex::new(())),
+            },
+            captcha: Captcha {
+                secret: Arc::new([1; 32]),
+                used: Arc::new(directory.join("captcha-used")),
+            },
+            ingest_slots: Arc::new(Semaphore::new(1)),
+            pairings: discovery.pairings.clone(),
+            provisioner: None,
+            discovery: Some(discovery),
+            cors_origins: Arc::new(Vec::new()),
+            keeper: Some(keeper),
+            replication: RuntimeOverview::default(),
+        },
+        Vec::new(),
+    )
+    .await
+    .unwrap()
+}
+
+pub(crate) async fn create_pairing(
+    state: AppState,
+    request: ControllerRequest,
 ) -> Result<(StatusCode, Json<Value>), PairingResponseError> {
     let pairings = state
         .pairings
@@ -353,10 +370,10 @@ async fn create_pairing(
     ))
 }
 
-async fn pairing_decision(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+pub(crate) async fn pairing_decision(
+    state: AppState,
+    id: String,
+    request: ControllerRequest,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
@@ -369,10 +386,10 @@ async fn pairing_decision(
     ))
 }
 
-async fn pairing_status(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+pub(crate) async fn pairing_status(
+    state: AppState,
+    id: String,
+    request: ControllerRequest,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
@@ -402,10 +419,10 @@ async fn pairing_status(
     ))
 }
 
-async fn pairing_provision(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    axum::extract::Json(request): axum::extract::Json<ControllerRequest>,
+pub(crate) async fn pairing_provision(
+    state: AppState,
+    id: String,
+    request: ControllerRequest,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
@@ -464,9 +481,9 @@ async fn pairing_provision(
     })?))
 }
 
-async fn admin_login(
-    State(state): State<AppState>,
-    axum::extract::Json(input): axum::extract::Json<LoginRequest>,
+pub(crate) async fn admin_login(
+    state: AppState,
+    input: LoginRequest,
 ) -> Result<Response, PairingResponseError> {
     let pairings = state
         .pairings
@@ -485,8 +502,8 @@ async fn admin_login(
     Ok(response)
 }
 
-async fn admin_list(
-    State(state): State<AppState>,
+pub(crate) async fn admin_list(
+    state: AppState,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
@@ -506,11 +523,120 @@ async fn admin_list(
     Ok(Json(json!({"pairings":rows})))
 }
 
-async fn admin_decision(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+pub(crate) async fn admin_overview(
+    state: AppState,
     headers: axum::http::HeaderMap,
-    axum::extract::Json(input): axum::extract::Json<Value>,
+) -> Result<Json<Value>, PairingResponseError> {
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    pairings.admin_list(cookie).map_err(PairingResponseError)?;
+    let keeper = state
+        .keeper
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let mut overview = keeper
+        .admin_overview()
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let runtime = state.replication.snapshot();
+    let mut active_peers = 0usize;
+    let mut last_success_at = None::<u64>;
+    let mut last_error_category = None::<String>;
+    let boards = overview["keeper"]["boards"]
+        .as_array_mut()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    for board in boards.iter_mut() {
+        let workspace = board["workspaceId"].as_str().unwrap_or_default();
+        let status = runtime.get(workspace).cloned().unwrap_or_default();
+        active_peers += status.active_peers;
+        last_success_at = last_success_at.max(status.last_success_at);
+        if status.last_error_category.is_some() {
+            last_error_category = status.last_error_category.clone();
+        }
+        board["replication"] =
+            serde_json::to_value(status).unwrap_or_else(|_| json!({"state":"unknown"}));
+    }
+    let inbox_entries = fs::read_dir(state.inbox.directory.as_ref())
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let pending_count = inbox_entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    let mut outcomes = BTreeMap::from([
+        ("awaitingMesh", 0usize),
+        ("chatQueued", 0usize),
+        ("cardCreated", 0usize),
+    ]);
+    let mut last_result_at = None::<u64>;
+    for entry in fs::read_dir(state.inbox.results.as_ref())
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(result) = serde_json::from_slice::<ProcessingResult>(&bytes) else {
+            continue;
+        };
+        let key = match result.status.as_str() {
+            "awaiting_mesh" => "awaitingMesh",
+            "chat_queued" => "chatQueued",
+            "card_created_v2" => "cardCreated",
+            _ => continue,
+        };
+        *outcomes.get_mut(key).expect("known intake outcome") += 1;
+        last_result_at = last_result_at.max(
+            entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs()),
+        );
+    }
+    let state_name = if active_peers > 0 {
+        "connected"
+    } else if boards
+        .iter()
+        .any(|board| board["replication"]["state"] == "retrying")
+    {
+        "retrying"
+    } else if boards
+        .iter()
+        .any(|board| board["replication"]["state"] == "connecting")
+    {
+        "connecting"
+    } else {
+        "idle"
+    };
+    overview["triggers"] = json!([{
+        "id":"jev-intake",
+        "name":"JEV intake",
+        "configured":std::env::var("JEV_API_KEY").is_ok_and(|key| !key.trim().is_empty()),
+        "model":JEV_MODEL,
+        "targetWorkspaceId":keeper.configuration().map_err(|_| PairingResponseError(PairingError::Unavailable))?.workspace_id,
+        "pendingCount":pending_count,
+        "outcomes":outcomes,
+        "lastResultAt":last_result_at,
+    }]);
+    overview["replication"] = json!({
+        "state":state_name,
+        "activePeers":active_peers,
+        "lastSuccessAt":last_success_at,
+        "lastErrorCategory":last_error_category,
+    });
+    Ok(Json(overview))
+}
+
+pub(crate) async fn admin_decision(
+    state: AppState,
+    id: String,
+    headers: axum::http::HeaderMap,
+    input: Value,
 ) -> Result<Json<Value>, PairingResponseError> {
     let pairings = state
         .pairings
@@ -537,20 +663,6 @@ async fn admin_decision(
     ))
 }
 
-async fn admin_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Lighthouse approval</title><style>
-    :root{--paper:#f3f0e8;--ink:#171717;--muted:#6b675f;--line:#171717;--yellow:#ffd43b;--red:#ff5a36;--panel:#fffdf7;--soft:#e9e5db;--focus:#176b4d;font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:var(--ink);background:var(--paper);font-synthesis:none;text-rendering:optimizeLegibility}
-    *{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;min-height:100vh;background:var(--paper)}main{width:min(760px,100%);margin:0 auto;padding:clamp(20px,5vw,56px)}h1{font-size:clamp(1.6rem,4vw,2.2rem);letter-spacing:-.04em}#login{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin:24px 0}label{display:grid;gap:7px;color:var(--muted);font-size:.82rem;font-weight:750}input{min-height:46px;min-width:min(300px,75vw);padding:9px 12px;border:2px solid var(--line);border-radius:0;background:var(--panel);font:inherit;color:var(--ink)}button{min-height:40px;padding:8px 12px;border:2px solid var(--line);border-radius:0;background:white;color:var(--ink);font:inherit;font-weight:750;cursor:pointer}button:hover:not(:disabled){transform:translate(-2px,-2px);box-shadow:3px 3px 0 var(--ink)}button:focus-visible,input:focus-visible{outline:3px solid var(--focus);outline-offset:3px}button:disabled{cursor:default;opacity:.55}#requests{display:grid;gap:18px}article{padding:18px;border:2px solid var(--line);background:var(--panel);box-shadow:5px 5px 0 var(--ink)}article h2{margin:0 0 10px;font-size:1.15rem}article p{line-height:1.5}article ul{padding-left:22px;line-height:1.7}#message{min-height:1.5em;color:var(--muted);font-weight:700}#message[data-error="true"]{color:#9d2f21}
-    </style></head><body><main><h1>Lighthouse approvals</h1><form id="login"><label>Operator token <input id="secret" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="message" role="status"></p><section id="requests"></section></main><script>
-    let csrf=""; const message=document.querySelector('#message');
-    async function api(path, options={}) { const response=await fetch(path,{...options,headers:{'content-type':'application/json',...(csrf?{'x-csrf-token':csrf}:{}),...(options.headers||{})}}); const value=await response.json().catch(()=>({})); if(!response.ok) throw new Error(value.message||`Request failed (${response.status})`); return value; }
-    async function load(){const data=await api('/admin/api/pairings'); document.querySelector('#requests').innerHTML=''; for(const p of data.pairings){const row=document.createElement('article'); const title=document.createElement('h2'); title.textContent=`${p.controller.displayName} · ${p.comparisonCode}`; row.append(title); const fingerprints=document.createElement('p'); fingerprints.textContent=`Controller ${p.controllerFingerprint} · service ${p.serviceFingerprint}`; row.append(fingerprints); const list=document.createElement('ul'); for(const s of p.scopes){const li=document.createElement('li'); li.textContent=`${s.title} · ${s.mode}`; list.append(li)} row.append(list); const futureBoards=document.createElement('p'); futureBoards.textContent=p.futureBoards===true?'Future boards: included in this approval':'Future boards: not included in this approval'; row.append(futureBoards); const status=document.createElement('p'); status.textContent=`Controller approval: ${p.controllerApproved===true?'approved':p.controllerApproved===false?'declined':'pending'}`; row.append(status); for(const decision of ['approve','decline']){const button=document.createElement('button'); button.textContent=decision==='approve'?'Approve exact boards':'Decline'; button.disabled=p.operatorApproved!==null||p.controllerApproved===false; button.onclick=async()=>{try{await api(`/admin/api/pairings/${encodeURIComponent(p.id)}/decision`,{method:'POST',body:JSON.stringify({decision})}); message.textContent=''; message.dataset.error='false'; await load()}catch(error){message.textContent=error instanceof Error?error.message:'Decision failed'; message.dataset.error='true'}}; row.append(button)} document.querySelector('#requests').append(row)}}
-    document.querySelector('#login').onsubmit=async event=>{event.preventDefault();try{const result=await api('/admin/api/session',{method:'POST',body:JSON.stringify({secret:document.querySelector('#secret').value})});csrf=result.csrfToken;document.querySelector('#login').hidden=true;message.textContent='Signed in';message.dataset.error='false';await load()}catch(error){message.textContent=error instanceof Error?error.message:'Sign-in failed';message.dataset.error='true'}};
-    </script></html>"#,
-    )
-}
-
 fn admin_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers
         .get(header::COOKIE)?
@@ -560,7 +672,7 @@ fn admin_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
         .find_map(|pair| pair.trim().strip_prefix("mesh_lighthouse_admin="))
 }
 
-struct PairingResponseError(PairingError);
+pub(crate) struct PairingResponseError(pub(crate) PairingError);
 impl IntoResponse for PairingResponseError {
     fn into_response(self) -> Response {
         let error = self.0;
@@ -568,8 +680,8 @@ impl IntoResponse for PairingResponseError {
     }
 }
 
-async fn discover(
-    State(state): State<AppState>,
+pub(crate) async fn discover(
+    state: AppState,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(origin) = headers
@@ -591,7 +703,7 @@ async fn discover(
         }))))
 }
 
-async fn challenge(State(state): State<AppState>) -> Result<Json<Challenge>, StatusCode> {
+pub(crate) async fn challenge(state: AppState) -> Result<Json<Challenge>, StatusCode> {
     let mut random = rand::rng();
     let payload = CaptchaPayload {
         left: 2 + (random.next_u32() % 8) as u8,
@@ -612,9 +724,9 @@ async fn challenge(State(state): State<AppState>) -> Result<Json<Challenge>, Sta
     }))
 }
 
-async fn ingest(
-    State(state): State<AppState>,
-    Json(mut input): Json<IncomingMessage>,
+pub(crate) async fn ingest(
+    state: AppState,
+    mut input: IncomingMessage,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, &'static str)> {
     input.message = input.message.trim().to_owned();
     input.contact = input.contact.trim().to_owned();
@@ -1537,11 +1649,13 @@ mod tests {
             pairings: Some(pairing_service.clone()),
             provisioner: None,
             cors_origins: Arc::new(vec![]),
+            keeper: None,
+            replication: RuntimeOverview::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, http_app(state, vec![]))
+            axum::serve(listener, http_app(state, vec![]).await.unwrap())
                 .await
                 .unwrap()
         });
@@ -1845,14 +1959,19 @@ mod tests {
             pairings: None,
             provisioner: None,
             cors_origins: Arc::new(vec!["https://match.example".into()]),
+            keeper: None,
+            replication: RuntimeOverview::default(),
         };
         let allowed_origin = "https://match.example".parse::<HeaderValue>().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, http_app(state, vec![allowed_origin]))
-                .await
-                .unwrap()
+            axum::serve(
+                listener,
+                http_app(state, vec![allowed_origin]).await.unwrap(),
+            )
+            .await
+            .unwrap()
         });
 
         let client = reqwest::Client::new();

@@ -11,6 +11,8 @@ use serde_json::Value;
 use time::{OffsetDateTime, macros::format_description};
 use tokio::sync::Mutex;
 
+mod app;
+mod controllers;
 mod http;
 mod join;
 mod keeper;
@@ -83,7 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             return Err("Too many serve-http arguments".into());
         }
         let discovery = load_discovery(&directory)?;
-        return http::serve(directory, address, None, discovery).await;
+        return http::serve(
+            directory,
+            address,
+            None,
+            discovery,
+            None,
+            replication::RuntimeOverview::default(),
+        )
+        .await;
     }
     if args.next().is_some() {
         return Err("Too many arguments".into());
@@ -143,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ))
     });
     let service = Arc::new(Mutex::new(NativeScopeService::new(host.clone())));
+    let runtime_overview = replication::RuntimeOverview::default();
     if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
         let directory = config
             .state_path
@@ -185,8 +196,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = request.response.send(result);
             }
         });
+        let http_host = host.clone();
+        let http_runtime = runtime_overview.clone();
         tokio::spawn(async move {
-            if let Err(error) = http::serve(directory, address, Some(lead_sender), discovery).await
+            if let Err(error) = http::serve(
+                directory,
+                address,
+                Some(lead_sender),
+                discovery,
+                Some(http_host),
+                http_runtime,
+            )
+            .await
             {
                 eprintln!("Lighthouse HTTP: {error}");
             }
@@ -223,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let route_sequence = previous.saturating_add(1).max(now_ms()?.try_into()?);
     route_store.write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
     host.refresh_routes(route_sequence)?;
-    replication::run(node, service, host).await
+    replication::run(node, service, host, runtime_overview).await
 }
 
 fn load_discovery(
