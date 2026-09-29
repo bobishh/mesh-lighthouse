@@ -1,3 +1,5 @@
 /target/
 /.env
 /state/
+/frontend/test-results/
+/frontend/playwright-report/

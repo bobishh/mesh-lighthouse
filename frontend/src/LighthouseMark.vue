@@ -1,0 +1,16 @@
+<template>
+  <svg class="lighthouse-mark" viewBox="0 0 64 64" role="img" aria-label="Lighthouse">
+    <path d="M23 20 4 11l2 15 17-4ZM41 20l19-9-2 15-17-4Z" fill="#ffe7a0" stroke="#171717" stroke-width="2.5" stroke-linejoin="round" />
+    <path d="M24 17 32 9l8 8Z" fill="#c9362a" stroke="#171717" stroke-width="2.5" stroke-linejoin="round" />
+    <path d="M26 18h12v10H26z" fill="#fffdf7" stroke="#171717" stroke-width="2.5" />
+    <path d="M29 20h6v8h-6z" fill="#ffe7a0" stroke="#171717" stroke-width="2" />
+    <path d="M25 28h14l5 28H20z" fill="#fffdf7" />
+    <path d="M24 35h16l1.4 8H22.6zM21.5 49h21l1.5 7H20z" fill="#c9362a" />
+    <path d="M25 28h14l5 28H20z" fill="none" stroke="#171717" stroke-width="3" stroke-linejoin="round" />
+    <path d="M18 56h28" stroke="#171717" stroke-width="3" stroke-linecap="round" />
+  </svg>
+</template>
+
+<style scoped>
+.lighthouse-mark { flex: 0 0 32px; width: 32px; height: 32px; }
+</style>

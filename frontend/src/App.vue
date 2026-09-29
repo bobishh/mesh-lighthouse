@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
-import LighthouseMark from "@match/components/LighthouseMark.vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
+import LighthouseMark from "./LighthouseMark.vue"
 
 type Board = {
   workspaceId: string
@@ -45,12 +45,13 @@ const sessionLoading = ref(true)
 const sessionUnavailable = ref(false)
 const loading = ref(false)
 const error = ref("")
-const status = ref("")
 const overview = ref<Overview | null>(null)
 const pairings = ref<Pairing[]>([])
+const pollIntervalMs = 5_000
+let pollTimer: ReturnType<typeof setInterval> | undefined
+let refreshInFlight = false
+let sessionVersion = 0
 const replicationState = computed(() => overview.value?.replication.state ?? "idle")
-const online = computed(() => replicationState.value === "connected")
-const reconnecting = computed(() => ["connecting", "retrying"].includes(replicationState.value))
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
@@ -59,6 +60,7 @@ class ApiError extends Error {
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     credentials: "same-origin",
+    cache: "no-store",
     ...options,
     headers: {
       "content-type": "application/json",
@@ -85,7 +87,6 @@ function validMatchLoginUrl(value: string, challengeId: string) {
 
 async function signInWithMatch() {
   error.value = ""
-  status.value = ""
   loading.value = true
   try {
     const response = await api<{ challengeId: string; matchUrl: string }>("/admin/api/login/challenge", {
@@ -100,12 +101,12 @@ async function signInWithMatch() {
 }
 
 function clearIdentity() {
+  sessionVersion++
   csrf.value = ""
   signedIn.value = false
   adminIdentity.value = null
   overview.value = null
   pairings.value = []
-  status.value = ""
 }
 
 async function logout() {
@@ -155,11 +156,7 @@ async function restoreSession() {
     await refresh()
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 403) {
-      csrf.value = ""
-      signedIn.value = false
-      overview.value = null
-      pairings.value = []
-      status.value = ""
+      clearIdentity()
     } else {
       sessionUnavailable.value = true
       error.value = cause instanceof Error ? cause.message : "Could not check operator session"
@@ -171,7 +168,6 @@ async function restoreSession() {
 
 async function signIn() {
   error.value = ""
-  status.value = ""
   try {
     const response = await api<{ csrfToken: string } & AdminIdentity>("/admin/api/session", {
       method: "POST",
@@ -189,22 +185,29 @@ async function signIn() {
 }
 
 async function refresh() {
-  loading.value = true
-  error.value = ""
+  if (refreshInFlight || !signedIn.value) return
+  refreshInFlight = true
+  const version = sessionVersion
   try {
     const [nextOverview, nextPairings] = await Promise.all([
       api<Overview>("/admin/api/overview"),
       api<{ pairings: Pairing[] }>("/admin/api/pairings"),
     ])
+    if (version !== sessionVersion) return
     overview.value = nextOverview
     pairings.value = nextPairings.pairings
-    status.value = "Overview updated"
+    error.value = ""
   } catch (cause) {
+    if (version !== sessionVersion) return
     if (cause instanceof ApiError && cause.status === 403) clearIdentity()
     error.value = cause instanceof Error ? cause.message : "Could not load keeper overview"
   } finally {
-    loading.value = false
+    refreshInFlight = false
   }
+}
+
+function refreshWhenVisible() {
+  if (!document.hidden && signedIn.value) void refresh()
 }
 
 async function decide(pairing: Pairing, decision: "approve" | "decline") {
@@ -233,10 +236,17 @@ function pairingStatus(pairing: Pairing) {
 }
 
 onMounted(async () => {
+  pollTimer = setInterval(refreshWhenVisible, pollIntervalMs)
+  document.addEventListener("visibilitychange", refreshWhenVisible)
   if (window.location.hash.startsWith("#login=")) {
     if (await exchangeLoginCode()) return
   }
   await restoreSession()
+})
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+  document.removeEventListener("visibilitychange", refreshWhenVisible)
 })
 
 </script>
@@ -245,15 +255,13 @@ onMounted(async () => {
   <div class="shell lighthouse-admin">
     <header class="topbar">
       <div class="brand">
-        <LighthouseMark :online="online" :reconnecting="reconnecting" />
+        <LighthouseMark />
         <div>
-          <h1>Lighthouse</h1>
-          <p class="brand-subtitle">Keeper service · {{ adminIdentity?.displayName || overview?.keeper.displayName || "Sign in" }}</p>
+          <h1>LIGHTHOUSE</h1>
         </div>
       </div>
       <div v-if="signedIn" class="admin-header-actions">
-        <button class="button button-small button-quiet" type="button" :disabled="loading" @click="refresh">{{ loading ? "Refreshing…" : "Refresh overview" }}</button>
-        <button class="button button-small button-quiet" type="button" :disabled="loading" @click="logout">Sign out</button>
+        <button class="button button-small button-quiet" type="button" @click="logout">Sign out</button>
       </div>
     </header>
 
@@ -278,16 +286,14 @@ onMounted(async () => {
       </form>
 
       <p v-if="error" class="admin-notice admin-notice-error" role="status">{{ error }}</p>
-      <p v-else-if="status" class="admin-notice" role="status">{{ status }}</p>
 
       <template v-if="signedIn && overview">
         <section aria-labelledby="keepers-title" class="admin-section">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">This Lighthouse identity</p>
               <h2 id="keepers-title">Keepers</h2>
             </div>
-            <span class="state-pill" :data-state="replicationState">Replication {{ replicationState }}</span>
+            <p class="replication-status" :data-state="replicationState">Replication {{ replicationState }}</p>
           </div>
 
           <article class="keeper-card">
@@ -296,7 +302,6 @@ onMounted(async () => {
                 <h3>{{ overview.keeper.displayName }}</h3>
                 <p class="muted">{{ overview.keeper.personId }}</p>
               </div>
-              <span class="service-label">Service keeper</span>
             </div>
 
             <div class="overview-grid">
@@ -304,7 +309,7 @@ onMounted(async () => {
                 <h4>Boards</h4>
                 <p v-if="!overview.keeper.boards.length" class="muted">No attached boards.</p>
                 <article v-for="board in overview.keeper.boards" :key="board.workspaceId" class="board-row">
-                  <div class="board-title"><strong>{{ board.title }}</strong><span v-if="board.isPrimary" class="tag">Primary</span></div>
+                  <div class="board-title"><strong>{{ board.title }}</strong><span v-if="board.isPrimary" class="muted">(primary board)</span></div>
                   <p>{{ board.peerCount }} authorized peers · {{ board.heads.length }} current heads</p>
                   <p>Saved {{ date(board.lastSavedAt) }} · replication {{ board.replication?.state ?? "idle" }}</p>
                   <p v-if="board.replication?.lastSuccessAt">Last exchange {{ date(board.replication.lastSuccessAt) }}</p>
@@ -316,8 +321,8 @@ onMounted(async () => {
                 <h4>Triggers</h4>
                 <p v-if="!overview.triggers.length" class="muted">No configured triggers.</p>
                 <article v-for="trigger in overview.triggers" :key="trigger.id" class="board-row">
-                  <div class="board-title"><strong>{{ trigger.name }}</strong><span class="tag" :data-state="trigger.configured ? 'ready' : 'off'">{{ trigger.configured ? "configured" : "not configured" }}</span></div>
-                  <p>{{ trigger.pendingCount }} pending · {{ trigger.model }}</p>
+                  <div class="board-title"><strong>{{ trigger.name }}</strong></div>
+                  <p>{{ trigger.configured ? "Configured" : "Not configured" }} · {{ trigger.pendingCount }} pending · {{ trigger.model }}</p>
                   <p>{{ trigger.outcomes.cardCreated }} cards created · {{ trigger.outcomes.chatQueued }} chats queued · {{ trigger.outcomes.awaitingMesh }} awaiting Match</p>
                 </article>
               </section>
@@ -327,8 +332,7 @@ onMounted(async () => {
 
         <section aria-labelledby="approvals-title" class="admin-section approvals-section">
           <div class="section-heading">
-            <div><p class="eyebrow">Separate from keeper status</p><h2 id="approvals-title">Approvals</h2></div>
-            <span class="count-pill">{{ pairings.length }}</span>
+            <h2 id="approvals-title">Approvals<span v-if="pairings.length"> ({{ pairings.length }})</span></h2>
           </div>
           <p v-if="!pairings.length" class="empty-state">No pending keeper requests. Create one from Match → Sync → Add keeper.</p>
           <article v-for="pairing in pairings" :key="pairing.id" class="approval-card">
