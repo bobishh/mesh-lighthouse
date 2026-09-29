@@ -783,3 +783,107 @@ fn outbound_inventory_uses_signed_route_person_field_and_only_targets_owner() {
     .unwrap();
     assert!(decoded.owner_workspace_ids.is_none());
 }
+
+/// Runs the actual config-mode process, including HTTP and Mesh workers.
+/// Build the binary first: cargo build --locked && cargo test --locked
+/// config_mode_sigterm_drains_http_and_exits_without_losing_durable_state -- --ignored
+#[tokio::test]
+#[ignore = "requires the separately built mesh-lighthouse executable"]
+async fn config_mode_sigterm_drains_http_and_exits_without_losing_durable_state() {
+    use std::{process::Command, time::Duration};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let keeper = TestKeeper::new();
+    let before = keeper.host.admin_overview().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let binary = std::env::var_os("LIGHTHOUSE_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/mesh-lighthouse")
+        });
+    let output = fs::File::create(keeper.directory.join("lifecycle.log")).unwrap();
+    let mut child = ChildGuard(
+        Command::new(binary)
+            .arg(&keeper.config_path)
+            .env("LIGHTHOUSE_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env(
+                "LIGHTHOUSE_PUBLIC_ORIGIN",
+                format!("http://127.0.0.1:{port}"),
+            )
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "service exited before HTTP ready"
+            );
+            if client
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("HTTP should become ready");
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(exit) = child.0.try_wait().unwrap() {
+                break exit;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("SIGTERM must stop HTTP, Mesh workers and the complete process");
+    assert!(
+        exit.success(),
+        "service must close node and return successfully: {exit}"
+    );
+    assert!(
+        client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .is_err()
+    );
+    let config: Config = serde_json::from_slice(&fs::read(&keeper.config_path).unwrap()).unwrap();
+    let reopened = KeeperHost::open(config, keeper.config_path.clone()).unwrap();
+    let after = reopened.admin_overview().unwrap();
+    assert_eq!(
+        before["boards"][0]["workspaceId"],
+        after["boards"][0]["workspaceId"]
+    );
+    assert_eq!(before["boards"][0]["heads"], after["boards"][0]["heads"]);
+    let mut host = reopened;
+    let peer = keeper.peer(&keeper.keeper, "primary-board");
+    host.open_scope(&peer)
+        .expect("signed durable snapshot remains admissible after SIGTERM");
+}

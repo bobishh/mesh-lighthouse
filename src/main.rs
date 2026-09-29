@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     let service = Arc::new(Mutex::new(NativeScopeService::new(host.clone())));
     let runtime_overview = replication::RuntimeOverview::default();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
     if let Ok(bind) = std::env::var("LIGHTHOUSE_HTTP_BIND") {
         let directory = config
             .state_path
@@ -199,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let http_host = host.clone();
         let http_runtime = runtime_overview.clone();
         tokio::spawn(async move {
-            if let Err(error) = http::serve(
+            match http::serve(
                 directory,
                 address,
                 Some(lead_sender),
@@ -209,13 +210,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
             {
-                eprintln!("Lighthouse HTTP: {error}");
+                Ok(()) => {
+                    // Loco drains active HTTP requests before returning successfully.
+                    let _ = shutdown_sender.send(());
+                }
+                Err(error) => eprintln!("Lighthouse HTTP: {error}"),
             }
         });
+    } else {
+        drop(discovery);
+        drop(shutdown_sender);
     }
     let incoming_node = Arc::clone(&node);
     let incoming_service = Arc::clone(&service);
-    tokio::spawn(async move {
+    let incoming = tokio::spawn(async move {
         loop {
             match serve_scope_request(&incoming_node, &incoming_service, now_ms().unwrap_or(0))
                 .await
@@ -244,7 +252,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let route_sequence = previous.saturating_add(1).max(now_ms()?.try_into()?);
     route_store.write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
     host.refresh_routes(route_sequence)?;
-    replication::run(node, service, host, runtime_overview).await
+    let result = replication::run(
+        Arc::clone(&node),
+        service,
+        host,
+        runtime_overview,
+        shutdown_receiver,
+    )
+    .await;
+    incoming.abort();
+    let _ = incoming.await;
+    // Worker cancellation finishes synchronous atomic store writes before releasing the node.
+    let node = Arc::try_unwrap(node).map_err(|_| "Lighthouse node still in use at shutdown")?;
+    node.close().await?;
+    result
 }
 
 fn load_discovery(

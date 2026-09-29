@@ -109,81 +109,109 @@ pub(crate) async fn run(
     service: Service,
     host: KeeperHost,
     overview: RuntimeOverview,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut workers = HashMap::<(String, String), tokio::task::JoinHandle<()>>::new();
     let mut authorized = HashSet::<String>::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tick.tick().await;
-        let mut targets = HashMap::new();
-        for (workspace, secret, routes) in host.scopes()? {
-            for route in routes {
-                if route != node.endpoint_id().to_string() {
-                    targets.insert((workspace.clone(), route), secret.clone());
+    let mut shutdown = Some(shutdown);
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                stopped = async {
+                    match shutdown.as_mut() {
+                        Some(receiver) => receiver.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if stopped.is_ok() {
+                        break Ok(());
+                    }
+                    // HTTP startup failure must not terminate Mesh replication.
+                    shutdown = None;
+                    continue;
                 }
             }
-        }
-        let next_authorized = targets
-            .keys()
-            .map(|(_, route)| route.clone())
-            .collect::<HashSet<_>>();
-        for route in next_authorized.difference(&authorized) {
-            if let Ok(id) = EndpointId::from_str(route) {
-                node.authorize_peer(id);
+            let mut targets = HashMap::new();
+            for (workspace, secret, routes) in host.scopes()? {
+                for route in routes {
+                    if route != node.endpoint_id().to_string() {
+                        targets.insert((workspace.clone(), route), secret.clone());
+                    }
+                }
             }
-        }
-        for route in authorized.difference(&next_authorized) {
-            if let Ok(id) = EndpointId::from_str(route) {
-                node.revoke_peer(&id);
+            let next_authorized = targets
+                .keys()
+                .map(|(_, route)| route.clone())
+                .collect::<HashSet<_>>();
+            for route in next_authorized.difference(&authorized) {
+                if let Ok(id) = EndpointId::from_str(route) {
+                    node.authorize_peer(id);
+                }
             }
-        }
-        authorized = next_authorized;
-        let removed = workers
-            .keys()
-            .filter(|key| !targets.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for (workspace, route) in removed {
-            if let Some(worker) = workers.remove(&(workspace.clone(), route.clone())) {
-                worker.abort();
+            for route in authorized.difference(&next_authorized) {
+                if let Ok(id) = EndpointId::from_str(route) {
+                    node.revoke_peer(&id);
+                }
             }
-            service.lock().await.forget_peer(&workspace, &route);
-            overview.forget(&workspace, &route);
-        }
-        for ((workspace, route), secret) in targets {
-            let key = (workspace.clone(), route.clone());
-            if workers
-                .get(&key)
-                .is_some_and(|worker| !worker.is_finished())
-            {
-                continue;
+            authorized = next_authorized;
+            let removed = workers
+                .keys()
+                .filter(|key| !targets.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for (workspace, route) in removed {
+                if let Some(worker) = workers.remove(&(workspace.clone(), route.clone())) {
+                    worker.abort();
+                    let _ = worker.await;
+                }
+                service.lock().await.forget_peer(&workspace, &route);
+                overview.forget(&workspace, &route);
             }
-            let peer_node = Arc::clone(&node);
-            let peer_service = Arc::clone(&service);
-            let host_for_worker = host.clone();
-            let overview_for_worker = overview.clone();
-            overview.update(&workspace, &route, |status| {
-                status.state = "connecting".into();
-                status.active_peers = 0;
-            });
-            workers.insert(
-                key,
-                tokio::spawn(async move {
-                    replicate(
-                        peer_node,
-                        peer_service,
-                        host_for_worker,
-                        overview_for_worker,
-                        workspace,
-                        secret,
-                        route,
-                    )
-                    .await;
-                }),
-            );
+            for ((workspace, route), secret) in targets {
+                let key = (workspace.clone(), route.clone());
+                if workers
+                    .get(&key)
+                    .is_some_and(|worker| !worker.is_finished())
+                {
+                    continue;
+                }
+                let peer_node = Arc::clone(&node);
+                let peer_service = Arc::clone(&service);
+                let host_for_worker = host.clone();
+                let overview_for_worker = overview.clone();
+                overview.update(&workspace, &route, |status| {
+                    status.state = "connecting".into();
+                    status.active_peers = 0;
+                });
+                workers.insert(
+                    key,
+                    tokio::spawn(async move {
+                        replicate(
+                            peer_node,
+                            peer_service,
+                            host_for_worker,
+                            overview_for_worker,
+                            workspace,
+                            secret,
+                            route,
+                        )
+                        .await;
+                    }),
+                );
+            }
         }
     }
+    .await;
+    for worker in workers.values() {
+        worker.abort();
+    }
+    for worker in workers.into_values() {
+        let _ = worker.await;
+    }
+    result
 }
 
 async fn serve_frames(
