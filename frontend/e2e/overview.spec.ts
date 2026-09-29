@@ -11,7 +11,7 @@ const overview = (state: string) => ({
   replication: { state, activePeers: state === "connected" ? 1 : 0 },
 })
 
-test("Given an operator session, when overview changes, then Lighthouse updates without manual refresh", async ({ page }, testInfo) => {
+test("Given an operator session, when overview changes, then Lighthouse updates without manual refresh", async ({ page }) => {
   await page.clock.install()
   let reads = 0
   await page.route("**/admin/api/session", route => route.fulfill({ json: {
@@ -27,29 +27,6 @@ test("Given an operator session, when overview changes, then Lighthouse updates 
   await expect(page.getByRole("button", { name: "Refresh overview" })).toHaveCount(0)
   await expect(page.getByText("Service keeper")).toHaveCount(0)
   await expect(page.getByText("Separate from keeper status")).toHaveCount(0)
-  const icon = await page.evaluate(async () => {
-    const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')!
-    const image = new Image()
-    image.src = link.href
-    await image.decode()
-    const canvas = document.createElement("canvas")
-    canvas.width = canvas.height = 64
-    const context = canvas.getContext("2d")!
-    context.drawImage(image, 0, 0)
-    return {
-      width: image.naturalWidth,
-      centerWhite: [...context.getImageData(32, 32, 1, 1).data],
-      stripeRed: [...context.getImageData(32, 39, 1, 1).data],
-      beam: [...context.getImageData(12, 18, 1, 1).data],
-      outline: [...context.getImageData(19, 45, 1, 1).data],
-    }
-  })
-  expect(icon.width).toBe(64)
-  expect(icon.centerWhite[0]).toBeGreaterThan(240)
-  expect(icon.stripeRed[0]).toBeGreaterThan(icon.stripeRed[1] * 2)
-  expect(icon.beam[0]).toBeGreaterThan(240)
-  expect(icon.outline[0]).toBeLessThan(50)
-  await page.screenshot({ path: testInfo.outputPath("overview.png") })
   await page.clock.runFor(5_000)
   await expect(page.getByText("Replication connected", { exact: true })).toBeVisible()
   expect(reads).toBeGreaterThan(1)

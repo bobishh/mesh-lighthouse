@@ -261,7 +261,7 @@ onUnmounted(() => {
         </div>
       </div>
       <div v-if="signedIn" class="admin-header-actions">
-        <button class="button button-small button-quiet" type="button" @click="logout">Sign out</button>
+        <button class="button button-quiet" type="button" @click="logout">Sign out</button>
       </div>
     </header>
 
@@ -281,7 +281,7 @@ onUnmounted(() => {
           <p class="section-copy">Operator token grants service-wide approval access.</p>
           <label class="field-label" for="operator-token">Operator token</label>
           <input id="operator-token" v-model="token" type="password" autocomplete="current-password" required />
-          <button class="button button-small button-quiet" type="submit">Sign in as operator</button>
+          <button class="button button-quiet" type="submit">Sign in as operator</button>
         </details>
       </form>
 
@@ -343,8 +343,8 @@ onUnmounted(() => {
             <p>Controller approval: {{ pairing.controllerApproved === true ? "approved" : pairing.controllerApproved === false ? "declined" : "pending" }}</p>
             <div class="dialog-actions">
               <template v-if="adminIdentity?.operator">
-                <button class="button button-primary button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'approve')">Approve exact boards</button>
-                <button class="button button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'decline')">Decline</button>
+                <button class="button button-primary" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'approve')">Approve exact boards</button>
+                <button class="button" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'decline')">Decline</button>
               </template>
             <p v-else class="muted" role="status">{{ pairingStatus(pairing) }}</p>
             </div>
