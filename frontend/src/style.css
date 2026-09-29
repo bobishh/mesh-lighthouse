@@ -1,0 +1,35 @@
+.lighthouse-admin { min-height: 100vh; }
+.lighthouse-admin .topbar { position: sticky; top: 0; z-index: 2; }
+.brand-subtitle { margin: 4px 0 0; color: var(--muted); font-size: .78rem; }
+.admin-content { width: min(1000px, 100%); margin: 0 auto; padding: clamp(20px, 5vw, 56px) clamp(16px, 4vw, 40px) 64px; }
+.admin-section { margin: 0 0 44px; }
+.section-heading { justify-content: space-between; margin-bottom: 16px; }
+.section-heading h2 { margin: 0; font-size: clamp(1.5rem, 4vw, 2rem); letter-spacing: -.04em; }
+.eyebrow { margin: 0 0 5px; color: var(--muted); font: 800 .67rem/1.3 ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.section-copy, .muted { color: var(--muted); line-height: 1.5; }
+.keeper-card, .approval-card, .login-card { padding: clamp(16px, 3vw, 24px); border: 2px solid var(--line); background: var(--panel); box-shadow: var(--shadow); }
+.keeper-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding-bottom: 18px; border-bottom: 2px solid var(--soft); }
+.keeper-heading h3, .approval-card h3 { margin: 0 0 5px; }
+.keeper-heading p { margin: 0; overflow-wrap: anywhere; font: 700 .7rem/1.5 ui-monospace, monospace; }
+.service-label, .tag, .state-pill, .count-pill { padding: 5px 8px; border: 1px solid var(--line); background: var(--yellow); font: 800 .65rem/1.2 ui-monospace, monospace; white-space: nowrap; }
+.overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 26px; padding-top: 8px; }
+.overview-group h4 { margin: 12px 0; font-size: .95rem; }
+.board-row { padding: 13px 0; border-top: 1px solid var(--soft); }
+.board-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.board-row p, .approval-card p { margin: 6px 0 0; color: var(--muted); font-size: .84rem; line-height: 1.45; }
+.tag[data-state="off"] { background: var(--soft); }
+.tag[data-state="ready"] { background: var(--green); }
+.state-pill[data-state="connected"] { background: var(--green); }
+.state-pill[data-state="retrying"] { background: #ffcc80; }
+.count-pill { min-width: 34px; text-align: center; background: var(--soft); }
+.empty-state { padding: 18px; border: 2px dashed var(--line); color: var(--muted); line-height: 1.55; }
+.approvals-section { display: grid; gap: 14px; }
+.approval-card { box-shadow: 4px 4px 0 var(--ink); }
+.approval-card ul { padding-left: 22px; line-height: 1.7; }
+.login-card { display: grid; justify-items: start; gap: 12px; max-width: 480px; margin: 32px auto; }
+.login-card h2, .login-card p { margin: 0; }
+.field-label { display: grid; gap: 7px; color: var(--muted); font-size: .82rem; font-weight: 750; }
+.login-card input { width: min(360px, 80vw); min-height: var(--control-size); padding: 9px 12px; border: 2px solid var(--line); background: var(--panel); }
+.notice { min-height: 1.5em; color: var(--muted); font-weight: 700; }
+.notice-error { color: #9d2f21; }
+@media (max-width: 600px) { .lighthouse-admin .topbar { padding: 12px 16px; } .keeper-heading { flex-direction: column; } }
