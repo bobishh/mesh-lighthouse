@@ -142,8 +142,8 @@ function date(value?: number | null) {
         <button class="button button-primary" type="submit">Sign in</button>
       </form>
 
-      <p v-if="error" class="notice notice-error" role="status">{{ error }}</p>
-      <p v-else-if="status" class="notice" role="status">{{ status }}</p>
+      <p v-if="error" class="admin-notice admin-notice-error" role="status">{{ error }}</p>
+      <p v-else-if="status" class="admin-notice" role="status">{{ status }}</p>
 
       <template v-if="signedIn && overview">
         <section aria-labelledby="keepers-title" class="admin-section">
