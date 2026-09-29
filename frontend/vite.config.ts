@@ -4,7 +4,7 @@ import vue from "@vitejs/plugin-vue"
 
 const matchSource = process.env.MATCH_UI_SOURCE
   ? fileURLToPath(new URL(process.env.MATCH_UI_SOURCE, import.meta.url))
-  : fileURLToPath(new URL("../../../rust-flapping-match-authority/match/src", import.meta.url))
+  : fileURLToPath(new URL("../match/src", import.meta.url))
 
 export default defineConfig({
   base: "/admin/",
