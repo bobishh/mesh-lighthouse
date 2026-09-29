@@ -107,7 +107,7 @@ async fn boot(
                     "allow_methods": ["GET", "POST"], "allow_headers": ["content-type"]},
                 "logger": {"enable": false},
                 "etag": {"enable": false},
-                "static_assets": {"enable": true, "must_exist": false,
+                "static": {"enable": true, "must_exist": false,
                     "folder": {"uri": "/admin", "path": assets},
                     "fallback": assets.join("index.html"), "cache_control": "no-cache"}
             }

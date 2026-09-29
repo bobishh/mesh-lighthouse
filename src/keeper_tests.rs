@@ -785,7 +785,7 @@ fn outbound_inventory_uses_signed_route_person_field_and_only_targets_owner() {
 }
 
 /// Runs the actual config-mode process, including HTTP and Mesh workers.
-/// Build the binary first: cargo build --locked && cargo test --locked
+/// Build frontend assets and binary first: cargo build --locked && cargo test --locked
 /// config_mode_sigterm_drains_http_and_exits_without_losing_durable_state -- --ignored
 #[tokio::test]
 #[ignore = "requires the separately built mesh-lighthouse executable"]
@@ -846,6 +846,63 @@ async fn config_mode_sigterm_drains_http_and_exits_without_losing_durable_state(
     })
     .await
     .expect("HTTP should become ready");
+    for path in ["/admin", "/admin/", "/admin/index.html"] {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{path} must serve Vue index"
+        );
+        assert!(
+            response.headers()[reqwest::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(response.text().await.unwrap().contains("/admin/assets/"));
+    }
+    let assets = crate::app::frontend_directory().join("assets");
+    let mut checked_js = false;
+    let mut checked_css = false;
+    for asset in fs::read_dir(&assets).expect("build frontend before process smoke test") {
+        let path = asset.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if filename.ends_with(".js") || filename.ends_with(".css") {
+            let response = client
+                .get(format!("http://127.0.0.1:{port}/admin/assets/{filename}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "built asset {filename} must be served"
+            );
+            assert_eq!(
+                response.headers()[reqwest::header::CACHE_CONTROL],
+                "public, max-age=31536000, immutable"
+            );
+            checked_js |= filename.ends_with(".js");
+            checked_css |= filename.ends_with(".css");
+        }
+    }
+    assert!(
+        checked_js && checked_css,
+        "Vue JS and CSS build output required"
+    );
+    assert!(
+        client
+            .get(format!(
+                "http://127.0.0.1:{port}/assets/inter-latin-wght-normal.woff2"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
     assert!(
         Command::new("/bin/kill")
             .args(["-TERM", &child.0.id().to_string()])
