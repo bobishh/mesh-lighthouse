@@ -389,6 +389,17 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
         client.get(&url).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
+    let session_url = format!("{origin}/admin/api/session");
+    for cookie in [None, Some("mesh_lighthouse_admin=invalid-session")] {
+        let mut request = client.get(&session_url);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
     let login = client
         .post(format!("{origin}/admin/api/session"))
         .json(&json!({"secret":admin_secret}))
@@ -403,6 +414,17 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
         .next()
         .unwrap()
         .to_owned();
+    let original_session = login.json::<Value>().await.unwrap();
+    let restored = client
+        .get(&session_url)
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert_eq!(restored.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(!restored.headers().contains_key(header::SET_COOKIE));
+    assert_eq!(restored.json::<Value>().await.unwrap(), original_session);
     let response = client
         .get(&url)
         .header(header::COOKIE, &cookie)

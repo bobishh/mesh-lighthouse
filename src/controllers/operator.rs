@@ -18,7 +18,7 @@ use serde_json::Value;
 pub(crate) fn routes() -> Routes {
     Routes::new()
         .prefix("/admin/api")
-        .add("/session", post(login))
+        .add("/session", get(session).post(login))
         .add("/pairings", get(pairings))
         .add("/overview", get(overview))
         .add("/pairings/{id}/decision", post(decision))
@@ -35,6 +35,12 @@ async fn pairings(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     http::admin_list(state, headers).await
+}
+async fn session(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_session(state, headers).await
 }
 async fn decision(
     SharedStore(state): SharedStore<AppState>,

@@ -523,6 +523,24 @@ pub(crate) async fn admin_list(
     Ok(Json(json!({"pairings":rows})))
 }
 
+pub(crate) async fn admin_session(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let session = pairings
+        .admin_session(cookie)
+        .map_err(PairingResponseError)?;
+    let mut response = Json(session).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 pub(crate) async fn admin_overview(
     state: AppState,
     headers: axum::http::HeaderMap,

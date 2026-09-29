@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import LighthouseMark from "@match/components/LighthouseMark.vue"
 
 type Board = {
@@ -39,6 +39,8 @@ type Pairing = {
 const csrf = ref("")
 const token = ref("")
 const signedIn = ref(false)
+const sessionLoading = ref(true)
+const sessionUnavailable = ref(false)
 const loading = ref(false)
 const error = ref("")
 const status = ref("")
@@ -47,6 +49,10 @@ const pairings = ref<Pairing[]>([])
 const replicationState = computed(() => overview.value?.replication.state ?? "idle")
 const online = computed(() => replicationState.value === "connected")
 const reconnecting = computed(() => ["connecting", "retrying"].includes(replicationState.value))
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message) }
+}
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -59,8 +65,33 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     },
   })
   const value = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(value.message || `Request failed (${response.status})`)
+  if (!response.ok) throw new ApiError(value.message || `Request failed (${response.status})`, response.status)
   return value as T
+}
+
+async function restoreSession() {
+  sessionLoading.value = true
+  sessionUnavailable.value = false
+  error.value = ""
+  try {
+    const response = await api<{ csrfToken: string }>("/admin/api/session")
+    csrf.value = response.csrfToken
+    signedIn.value = true
+    await refresh()
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 403) {
+      csrf.value = ""
+      signedIn.value = false
+      overview.value = null
+      pairings.value = []
+      status.value = ""
+    } else {
+      sessionUnavailable.value = true
+      error.value = cause instanceof Error ? cause.message : "Could not check operator session"
+    }
+  } finally {
+    sessionLoading.value = false
+  }
 }
 
 async function signIn() {
@@ -73,6 +104,7 @@ async function signIn() {
     })
     csrf.value = response.csrfToken
     signedIn.value = true
+    sessionUnavailable.value = false
     token.value = ""
     await refresh()
   } catch (cause) {
@@ -92,6 +124,12 @@ async function refresh() {
     pairings.value = nextPairings.pairings
     status.value = "Overview updated"
   } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 403) {
+      csrf.value = ""
+      signedIn.value = false
+      overview.value = null
+      pairings.value = []
+    }
     error.value = cause instanceof Error ? cause.message : "Could not load keeper overview"
   } finally {
     loading.value = false
@@ -116,6 +154,8 @@ function date(value?: number | null) {
   return new Date(value * 1000).toLocaleString()
 }
 
+onMounted(() => { void restoreSession() })
+
 </script>
 
 <template>
@@ -134,7 +174,13 @@ function date(value?: number | null) {
     </header>
 
     <main class="admin-content">
-      <form v-if="!signedIn" class="login-card" @submit.prevent="signIn">
+      <p v-if="sessionLoading" class="empty-state" role="status">Checking operator session…</p>
+      <section v-else-if="sessionUnavailable" class="login-card">
+        <h2>Session check unavailable</h2>
+        <p class="section-copy">Could not reach Lighthouse. Retry to check your operator session.</p>
+        <button class="button button-primary" type="button" @click="restoreSession">Retry session check</button>
+      </section>
+      <form v-else-if="!signedIn" class="login-card" @submit.prevent="signIn">
         <h2>Sign in</h2>
         <p class="section-copy">Use service operator token to view keeper boards and approve requests.</p>
         <label class="field-label" for="operator-token">Operator token</label>

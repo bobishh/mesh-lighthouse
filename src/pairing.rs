@@ -775,6 +775,15 @@ impl PairingService {
         public_key_fingerprint(&self.service_identity.public_key)
     }
 
+    pub fn admin_session(&self, cookie: &str) -> Result<SessionResponse, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        self.require_session(&mut state, cookie, None)?;
+        let session = state.sessions.get(cookie).ok_or(PairingError::Forbidden)?;
+        Ok(SessionResponse {
+            csrf_token: session.csrf.clone(),
+        })
+    }
+
     pub fn fingerprint(public_key: &str) -> String {
         public_key_fingerprint(public_key)
     }
