@@ -35,6 +35,56 @@ pub(crate) struct KeeperHost {
     registry: Arc<Mutex<Registry>>,
 }
 
+fn current_owner(scope: &MatchLighthouseHost) -> Result<String, String> {
+    Ok(scope.store.authority()?.expected_current_owner.person_id)
+}
+
+fn owner_workspace_ids(registry: &Registry, owner_person_id: &str) -> Result<Vec<String>, String> {
+    let mut workspace_ids = registry
+        .scopes
+        .iter()
+        .filter_map(|(workspace_id, scope)| match current_owner(scope) {
+            Ok(owner) if owner == owner_person_id => Some(Ok(workspace_id.clone())),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workspace_ids.sort();
+    Ok(workspace_ids)
+}
+
+fn owner_follows_future_boards(registry: &Registry, owner_person_id: &str) -> Result<bool, String> {
+    let has_current_board = registry.scopes.iter().try_fold(
+        false,
+        |found, (workspace_id, scope)| -> Result<bool, String> {
+            if found || current_owner(scope)? != owner_person_id {
+                return Ok(found);
+            }
+            let original_owner = std::iter::once(&registry.config)
+                .chain(registry.config.additional_scopes.iter())
+                .find(|config| config.workspace_id == *workspace_id)
+                .and_then(|config| config.controller_person_id.as_deref());
+            Ok(original_owner == Some(owner_person_id))
+        },
+    )?;
+    Ok(future_policy_matches_owner(
+        owner_person_id,
+        has_current_board,
+        &registry.config.provisioning_commits,
+    ))
+}
+
+fn future_policy_matches_owner(
+    owner_person_id: &str,
+    has_current_board: bool,
+    commits: &[ProvisioningCommit],
+) -> bool {
+    has_current_board
+        && commits.iter().any(|commit| {
+            commit.future_boards && commit.controller_person_id.as_deref() == Some(owner_person_id)
+        })
+}
+
 fn scope_host(config: &Config) -> Result<MatchLighthouseHost, String> {
     if config.local_handshake.workspace_id != config.workspace_id {
         return Err("Keeper handshake targets another scope".into());
@@ -79,7 +129,16 @@ fn scope_host(config: &Config) -> Result<MatchLighthouseHost, String> {
 }
 
 impl KeeperHost {
-    pub(crate) fn open(config: Config, config_path: PathBuf) -> Result<Self, String> {
+    pub(crate) fn open(mut config: Config, config_path: PathBuf) -> Result<Self, String> {
+        // Prior releases had one controller identity for all future-board commits.
+        // Import that identity before any new per-scope owner metadata is written.
+        if let Some(legacy_owner) = config.controller_person_id.clone() {
+            for commit in &mut config.provisioning_commits {
+                if commit.future_boards && commit.controller_person_id.is_none() {
+                    commit.controller_person_id = Some(legacy_owner.clone());
+                }
+            }
+        }
         let mut scopes = BTreeMap::new();
         for scope in std::iter::once(&config).chain(config.additional_scopes.iter()) {
             if scope.device_id != config.device_id
@@ -152,6 +211,10 @@ impl KeeperHost {
     }
 
     pub(crate) fn admin_overview(&self) -> Result<Value, String> {
+        self.overview_for_owner(None)
+    }
+
+    fn overview_for_owner(&self, owner_filter: Option<&str>) -> Result<Value, String> {
         let registry = self
             .registry
             .lock()
@@ -160,6 +223,10 @@ impl KeeperHost {
         let peer = serde_json::to_value(&registry.config.local_handshake.peer)
             .map_err(|error| error.to_string())?;
         for (workspace_id, scope) in &registry.scopes {
+            let owner_person_id = current_owner(scope)?;
+            if owner_filter.is_some_and(|owner| owner != owner_person_id) {
+                continue;
+            }
             let (title, heads) = scope.store.document_overview()?;
             let config = std::iter::once(&registry.config)
                 .chain(registry.config.additional_scopes.iter())
@@ -181,6 +248,7 @@ impl KeeperHost {
                 });
             boards.push(json!({
                 "workspaceId": workspace_id,
+                "ownerPersonId": owner_person_id,
                 "title": title,
                 "isPrimary": *workspace_id == registry.config.workspace_id,
                 "heads": heads,
@@ -197,6 +265,11 @@ impl KeeperHost {
                 "boards": boards,
             }
         }))
+    }
+
+    /// Owner view contains only boards whose verified current authority belongs to owner.
+    pub(crate) fn owner_overview(&self, owner_person_id: &str) -> Result<Value, String> {
+        self.overview_for_owner(Some(owner_person_id))
     }
 
     pub(crate) fn provisioning_commit(
@@ -219,7 +292,7 @@ impl KeeperHost {
     pub(crate) fn activate_provisioned_scopes(
         &self,
         mut staged: Vec<Config>,
-        commit: ProvisioningCommit,
+        mut commit: ProvisioningCommit,
     ) -> Result<(), String> {
         let mut registry = self
             .registry
@@ -231,7 +304,16 @@ impl KeeperHost {
             .iter()
             .find(|previous| previous.pairing_id == commit.pairing_id)
         {
-            return if previous == &commit {
+            let same_operation = previous.pairing_id == commit.pairing_id
+                && previous.operation_id == commit.operation_id
+                && previous.transcript_hash == commit.transcript_hash
+                && previous.invitation_id == commit.invitation_id
+                && previous.workspace_ids == commit.workspace_ids
+                && previous.snapshot_hash == commit.snapshot_hash
+                && previous.future_boards == commit.future_boards
+                && (previous.controller_person_id.is_none()
+                    || previous.controller_person_id == commit.controller_person_id);
+            return if same_operation {
                 Ok(())
             } else {
                 Err("Provisioning operation conflicts with durable activation".into())
@@ -241,7 +323,8 @@ impl KeeperHost {
             return Err("Provisioning has no staged scopes".into());
         }
         let mut staged_hosts = Vec::with_capacity(staged.len());
-        for scope in &staged {
+        let mut staged_owner: Option<String> = None;
+        for scope in &mut staged {
             if scope.device_id != next.device_id
                 || scope.iroh_secret != next.iroh_secret
                 || scope.device_seed != next.device_seed
@@ -260,28 +343,32 @@ impl KeeperHost {
             }
             let host = scope_host(scope)?;
             let owner = host.store.authority()?.expected_current_owner.person_id;
+            if staged_owner
+                .as_deref()
+                .is_some_and(|staged_owner| staged_owner != owner)
+            {
+                return Err("Provisioning cannot mix owners in one activation".into());
+            }
+            staged_owner = Some(owner.clone());
             if scope
                 .controller_person_id
                 .as_deref()
                 .is_some_and(|controller| controller != owner)
-                || (commit.future_boards
-                    && scope.controller_person_id.as_deref() != Some(owner.as_str()))
             {
                 return Err("Staged scope controller is not its verified current owner".into());
             }
-            if commit.future_boards
-                && next
-                    .controller_person_id
-                    .as_deref()
-                    .is_some_and(|current| current != owner)
-            {
-                return Err("Future-board following requires one verified owner identity".into());
-            }
-            if commit.future_boards {
-                next.controller_person_id = Some(owner);
-            }
+            // Persist original owner identity for policy lineage, even when future following is off.
+            scope.controller_person_id = Some(owner);
             staged_hosts.push((scope.workspace_id.clone(), host));
         }
+        if commit
+            .controller_person_id
+            .as_deref()
+            .is_some_and(|controller| staged_owner.as_deref() != Some(controller))
+        {
+            return Err("Provisioning controller is not the verified staged owner".into());
+        }
+        commit.controller_person_id = staged_owner;
         let staged_ids = staged
             .iter()
             .map(|scope| scope.workspace_id.clone())
@@ -345,13 +432,11 @@ impl KeeperHost {
             .registry
             .lock()
             .map_err(|_| "Keeper registry lock poisoned")?;
-        let Some(controller) = registry.config.controller_person_id.as_deref() else {
-            return Ok(frame);
-        };
         let scope = registry
             .scopes
             .get(workspace)
             .ok_or("Unknown keeper scope")?;
+        let owner = current_owner(scope)?;
         let snapshot = scope.store.clone().snapshot()?;
         // Catalog entries were verified against signed authority by MatchScopeStore.
         let owner_route = snapshot
@@ -362,7 +447,7 @@ impl KeeperHost {
                 peers.iter().any(|peer| {
                     peer.pointer("/advertisement/payload/personId")
                         .and_then(Value::as_str)
-                        == Some(controller)
+                        == Some(owner.as_str())
                         && peer
                             .pointer("/advertisement/payload/endpoint")
                             .and_then(Value::as_str)
@@ -378,7 +463,7 @@ impl KeeperHost {
             secret,
             workspace,
         )?;
-        handshake.owner_workspace_ids = Some(registry.scopes.keys().cloned().collect());
+        handshake.owner_workspace_ids = Some(owner_workspace_ids(&registry, &owner)?);
         meta_mesh_core::encode_mesh_handshake(
             "mesh-handshake-request",
             secret,
@@ -566,19 +651,20 @@ impl NativeScopeServiceHost for KeeperHost {
             .map_err(|_| "Keeper registry lock poisoned")?;
         // Native admission verifies this signed request before sending response.
         // Unauthenticated claims never receive the owner's scope inventory.
-        if registry
-            .config
-            .controller_person_id
-            .as_deref()
-            .is_some_and(|owner| {
-                request
-                    .peer
-                    .pointer("/advertisement/payload/personId")
-                    .and_then(Value::as_str)
-                    == Some(owner)
-            })
+        if let Some(owner) = registry
+            .scopes
+            .get(workspace_id)
+            .map(current_owner)
+            .transpose()?
         {
-            response["ownerWorkspaceIds"] = json!(registry.scopes.keys().collect::<Vec<_>>());
+            if request
+                .peer
+                .pointer("/advertisement/payload/personId")
+                .and_then(Value::as_str)
+                == Some(owner.as_str())
+            {
+                response["ownerWorkspaceIds"] = json!(owner_workspace_ids(&registry, &owner)?);
+            }
         }
         drop(registry);
         Ok((self.authority(workspace_id)?, response))
@@ -657,26 +743,27 @@ impl NativeScopeHost for KeeperScope {
             .registry
             .lock()
             .map_err(|_| "Keeper registry lock poisoned")?;
-        let Some(controller) = registry.config.controller_person_id.as_deref() else {
-            return Ok(None);
-        };
-        if !registry
-            .config
-            .provisioning_commits
-            .iter()
-            .any(|commit| commit.future_boards)
-            || self.peer.person_id != controller
-            || value["controllerPersonId"].as_str() != Some(controller)
-            || value["version"] != 1
-        {
-            return Err(
-                "Keeper owner offer is not authorized by the approved future-board policy".into(),
-            );
-        }
         let workspace_id = value["workspaceId"]
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("Missing keeper scope id")?;
+        let controller = self.peer.person_id.as_str();
+        if value["controllerPersonId"].as_str() != Some(controller) || value["version"] != 1 {
+            return Err("Keeper owner offer does not match authenticated owner".into());
+        }
+        let known_owner = registry
+            .scopes
+            .get(workspace_id)
+            .map(current_owner)
+            .transpose()?;
+        let authorized = if let Some(owner) = known_owner {
+            owner == controller
+        } else {
+            owner_follows_future_boards(&registry, controller)?
+        };
+        if !authorized {
+            return Err("Keeper owner offer is not authorized by this owner's policy".into());
+        }
         let envelope = &value["envelope"];
         let workspace = &value["workspace"];
         if envelope["workspaceId"] != workspace_id
@@ -817,21 +904,26 @@ impl NativeScopeHost for KeeperScope {
             .registry
             .lock()
             .map_err(|_| "Keeper registry lock poisoned")?;
-        let controller = registry
-            .config
-            .controller_person_id
-            .as_deref()
-            .ok_or("Keeper is not connected to an owner")?;
-        if self.peer.person_id != controller
-            || value["controllerPersonId"].as_str() != Some(controller)
-            || value["version"] != 1
-        {
-            return Err("Keeper offer is not from the approved owner".into());
-        }
         let workspace_id = value["workspaceId"]
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("Missing keeper scope id")?;
+        let controller = self.peer.person_id.as_str();
+        if value["controllerPersonId"].as_str() != Some(controller)
+            || value["version"] != 1
+            || self.store.authority()?.expected_current_owner.person_id != controller
+        {
+            return Err("Keeper offer is not from this scope's verified owner".into());
+        }
+        if registry
+            .scopes
+            .get(workspace_id)
+            .map(current_owner)
+            .transpose()?
+            .is_some_and(|owner| owner != controller)
+        {
+            return Err("Keeper offer targets another owner's scope".into());
+        }
         let envelope = &value["envelope"];
         let workspace = &value["workspace"];
         if envelope["workspaceId"] != workspace_id
@@ -940,7 +1032,7 @@ impl NativeScopeHost for KeeperScope {
             .join(format!("scope-{:032x}", rand::random::<u128>()));
         join::create_private_directory(&directory).map_err(|error| error.to_string())?;
         let mut pending = PendingScopeDirectory(Some(directory.clone()));
-        let scope = join::prepare_config(
+        let mut scope = join::prepare_config(
             &invite,
             &response,
             &directory,
@@ -952,6 +1044,7 @@ impl NativeScopeHost for KeeperScope {
             iroh_secret,
         )
         .map_err(|error| error.to_string())?;
+        scope.controller_person_id = Some(controller.to_owned());
         if let Some(existing) = registry.scopes.get(workspace_id) {
             let mut store = existing.store.clone();
             let state = &scope.initial_state;

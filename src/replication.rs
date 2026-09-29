@@ -65,7 +65,12 @@ impl RuntimeOverview {
         aggregate
     }
 
-    fn update(&self, workspace: &str, route: &str, change: impl FnOnce(&mut ScopeRuntimeStatus)) {
+    pub(crate) fn update(
+        &self,
+        workspace: &str,
+        route: &str,
+        change: impl FnOnce(&mut ScopeRuntimeStatus),
+    ) {
         if let Ok(mut statuses) = self.0.lock() {
             change(
                 statuses

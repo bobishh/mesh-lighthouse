@@ -56,6 +56,8 @@ pub(crate) struct ProvisioningCommit {
     pub(crate) snapshot_hash: String,
     #[serde(default)]
     pub(crate) future_boards: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) controller_person_id: Option<String>,
 }
 
 #[tokio::main]

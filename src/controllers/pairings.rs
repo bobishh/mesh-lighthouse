@@ -14,6 +14,13 @@ pub(crate) fn routes() -> Routes {
         .add("/{id}/provision", post(provision))
 }
 
+pub(crate) fn login_routes() -> Routes {
+    Routes::new()
+        .prefix("/v1/login")
+        .add("/challenges/{id}", axum::routing::get(login_challenge))
+        .add("/proof", post(login_proof))
+}
+
 async fn create(
     SharedStore(state): SharedStore<AppState>,
     Json(request): Json<ControllerRequest>,
@@ -40,4 +47,16 @@ async fn provision(
     Json(request): Json<ControllerRequest>,
 ) -> impl IntoResponse {
     http::pairing_provision(state, id, request).await
+}
+async fn login_challenge(
+    SharedStore(state): SharedStore<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    http::login_challenge(state, id).await
+}
+async fn login_proof(
+    SharedStore(state): SharedStore<AppState>,
+    Json(request): Json<ControllerRequest>,
+) -> impl IntoResponse {
+    http::login_proof(state, request).await
 }

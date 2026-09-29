@@ -24,6 +24,7 @@ type Overview = {
   triggers: Trigger[]
   replication: { state: string; activePeers: number; lastSuccessAt?: number | null; lastErrorCategory?: string | null }
 }
+type AdminIdentity = { personId: string | null; displayName: string; operator: boolean }
 type Pairing = {
   id: string
   comparisonCode: string
@@ -39,6 +40,7 @@ type Pairing = {
 const csrf = ref("")
 const token = ref("")
 const signedIn = ref(false)
+const adminIdentity = ref<AdminIdentity | null>(null)
 const sessionLoading = ref(true)
 const sessionUnavailable = ref(false)
 const loading = ref(false)
@@ -69,13 +71,86 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return value as T
 }
 
+function validMatchLoginUrl(value: string, challengeId: string) {
+  const target = new URL(value)
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)
+  if (target.username || target.password || target.hash || target.pathname !== "/login" || target.searchParams.size !== 2
+    || target.searchParams.get("keeper") !== window.location.origin
+    || target.searchParams.get("challenge") !== challengeId
+    || (target.protocol !== "https:" && !(loopback && target.protocol === "http:"))) {
+    throw new Error("Lighthouse returned an unsafe Match sign-in link.")
+  }
+  return target.toString()
+}
+
+async function signInWithMatch() {
+  error.value = ""
+  status.value = ""
+  loading.value = true
+  try {
+    const response = await api<{ challengeId: string; matchUrl: string }>("/admin/api/login/challenge", {
+      method: "POST",
+      body: JSON.stringify({}),
+    })
+    window.location.assign(validMatchLoginUrl(response.matchUrl, response.challengeId))
+  } catch (cause) {
+    loading.value = false
+    error.value = cause instanceof Error ? cause.message : "Could not start Match sign-in."
+  }
+}
+
+function clearIdentity() {
+  csrf.value = ""
+  signedIn.value = false
+  adminIdentity.value = null
+  overview.value = null
+  pairings.value = []
+  status.value = ""
+}
+
+async function logout() {
+  error.value = ""
+  try {
+    await api("/admin/api/logout", { method: "POST", body: JSON.stringify({}) })
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "Could not sign out."
+    return
+  }
+  clearIdentity()
+}
+
+async function exchangeLoginCode() {
+  const code = new URLSearchParams(window.location.hash.slice(1)).get("login")
+  window.history.replaceState(null, "", window.location.pathname + window.location.search)
+  if (!code) return false
+  sessionLoading.value = true
+  error.value = ""
+  try {
+    const identity = await api<{ csrfToken: string } & AdminIdentity>("/admin/api/login/exchange", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    })
+    csrf.value = identity.csrfToken
+    adminIdentity.value = identity
+    signedIn.value = true
+    await refresh()
+  } catch (cause) {
+    clearIdentity()
+    error.value = cause instanceof Error ? cause.message : "Could not complete Match sign-in."
+  } finally {
+    sessionLoading.value = false
+  }
+  return true
+}
+
 async function restoreSession() {
   sessionLoading.value = true
   sessionUnavailable.value = false
   error.value = ""
   try {
-    const response = await api<{ csrfToken: string }>("/admin/api/session")
+    const response = await api<{ csrfToken: string } & AdminIdentity>("/admin/api/session")
     csrf.value = response.csrfToken
+    adminIdentity.value = response
     signedIn.value = true
     await refresh()
   } catch (cause) {
@@ -98,11 +173,12 @@ async function signIn() {
   error.value = ""
   status.value = ""
   try {
-    const response = await api<{ csrfToken: string }>("/admin/api/session", {
+    const response = await api<{ csrfToken: string } & AdminIdentity>("/admin/api/session", {
       method: "POST",
       body: JSON.stringify({ secret: token.value }),
     })
     csrf.value = response.csrfToken
+    adminIdentity.value = response
     signedIn.value = true
     sessionUnavailable.value = false
     token.value = ""
@@ -124,12 +200,7 @@ async function refresh() {
     pairings.value = nextPairings.pairings
     status.value = "Overview updated"
   } catch (cause) {
-    if (cause instanceof ApiError && cause.status === 403) {
-      csrf.value = ""
-      signedIn.value = false
-      overview.value = null
-      pairings.value = []
-    }
+    if (cause instanceof ApiError && cause.status === 403) clearIdentity()
     error.value = cause instanceof Error ? cause.message : "Could not load keeper overview"
   } finally {
     loading.value = false
@@ -154,7 +225,19 @@ function date(value?: number | null) {
   return new Date(value * 1000).toLocaleString()
 }
 
-onMounted(() => { void restoreSession() })
+function pairingStatus(pairing: Pairing) {
+  if (pairing.operatorApproved === false || pairing.controllerApproved === false) return "Keeper request declined. No access granted."
+  if (pairing.operatorApproved === null) return "Waiting for keeper operator to approve service access."
+  if (pairing.controllerApproved === null) return "Waiting for Match identity confirmation."
+  return "Both approvals are recorded. See board rows above for keeper replication status."
+}
+
+onMounted(async () => {
+  if (window.location.hash.startsWith("#login=")) {
+    if (await exchangeLoginCode()) return
+  }
+  await restoreSession()
+})
 
 </script>
 
@@ -165,12 +248,13 @@ onMounted(() => { void restoreSession() })
         <LighthouseMark :online="online" :reconnecting="reconnecting" />
         <div>
           <h1>Lighthouse</h1>
-          <p class="brand-subtitle">Keeper service · {{ overview?.keeper.displayName || "Operator console" }}</p>
+          <p class="brand-subtitle">Keeper service · {{ adminIdentity?.displayName || overview?.keeper.displayName || "Sign in" }}</p>
         </div>
       </div>
-      <button v-if="signedIn" class="button button-small button-quiet" type="button" :disabled="loading" @click="refresh">
-        {{ loading ? "Refreshing…" : "Refresh overview" }}
-      </button>
+      <div v-if="signedIn" class="admin-header-actions">
+        <button class="button button-small button-quiet" type="button" :disabled="loading" @click="refresh">{{ loading ? "Refreshing…" : "Refresh overview" }}</button>
+        <button class="button button-small button-quiet" type="button" :disabled="loading" @click="logout">Sign out</button>
+      </div>
     </header>
 
     <main class="admin-content">
@@ -182,10 +266,15 @@ onMounted(() => { void restoreSession() })
       </section>
       <form v-else-if="!signedIn" class="login-card" @submit.prevent="signIn">
         <h2>Sign in</h2>
-        <p class="section-copy">Use service operator token to view keeper boards and approve requests.</p>
-        <label class="field-label" for="operator-token">Operator token</label>
-        <input id="operator-token" v-model="token" type="password" autocomplete="current-password" required />
-        <button class="button button-primary" type="submit">Sign in</button>
+        <p class="section-copy">Use your Match identity to see boards connected to your account.</p>
+        <button class="button button-primary" type="button" :disabled="loading" @click="signInWithMatch">{{ loading ? "Opening Match…" : "Sign in with Match" }}</button>
+        <details class="service-admin-fallback">
+          <summary>Service administration</summary>
+          <p class="section-copy">Operator token grants service-wide approval access.</p>
+          <label class="field-label" for="operator-token">Operator token</label>
+          <input id="operator-token" v-model="token" type="password" autocomplete="current-password" required />
+          <button class="button button-small button-quiet" type="submit">Sign in as operator</button>
+        </details>
       </form>
 
       <p v-if="error" class="admin-notice admin-notice-error" role="status">{{ error }}</p>
@@ -249,8 +338,11 @@ onMounted(() => { void restoreSession() })
             <p>{{ pairing.futureBoards ? "Future boards included in approval" : "Future boards not included" }}</p>
             <p>Controller approval: {{ pairing.controllerApproved === true ? "approved" : pairing.controllerApproved === false ? "declined" : "pending" }}</p>
             <div class="dialog-actions">
-              <button class="button button-primary button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'approve')">Approve exact boards</button>
-              <button class="button button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'decline')">Decline</button>
+              <template v-if="adminIdentity?.operator">
+                <button class="button button-primary button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'approve')">Approve exact boards</button>
+                <button class="button button-small" type="button" :disabled="pairing.operatorApproved !== null || pairing.controllerApproved === false" @click="decide(pairing, 'decline')">Decline</button>
+              </template>
+            <p v-else class="muted" role="status">{{ pairingStatus(pairing) }}</p>
             </div>
           </article>
         </section>
@@ -258,3 +350,10 @@ onMounted(() => { void restoreSession() })
     </main>
   </div>
 </template>
+
+<style scoped>
+.admin-header-actions { display: flex; gap: 8px; }
+.service-admin-fallback { display: grid; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--soft); }
+.service-admin-fallback summary { color: var(--muted); cursor: pointer; font-weight: 750; }
+.service-admin-fallback input { width: min(360px, 80vw); min-height: var(--control-size); padding: 9px 12px; border: 2px solid var(--line); background: var(--panel); }
+</style>

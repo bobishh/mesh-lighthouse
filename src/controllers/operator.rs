@@ -1,6 +1,6 @@
 use crate::{
     http::{self, AppState},
-    pairing::LoginRequest,
+    pairing::{LoginExchangeRequest, LoginRequest},
 };
 use axum::{
     Json,
@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use loco_rs::{
-    controller::{ErrorDetail, Routes, format},
+    controller::{ErrorDetail, Routes},
     prelude::SharedStore,
 };
 use serde_json::Value;
@@ -19,6 +19,9 @@ pub(crate) fn routes() -> Routes {
     Routes::new()
         .prefix("/admin/api")
         .add("/session", get(session).post(login))
+        .add("/login/challenge", post(login_challenge))
+        .add("/login/exchange", post(login_exchange))
+        .add("/logout", post(logout))
         .add("/pairings", get(pairings))
         .add("/overview", get(overview))
         .add("/pairings/{id}/decision", post(decision))
@@ -29,6 +32,25 @@ async fn login(
     Json(input): Json<LoginRequest>,
 ) -> impl IntoResponse {
     http::admin_login(state, input).await
+}
+async fn login_challenge(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_login_challenge(state, headers).await
+}
+async fn login_exchange(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<LoginExchangeRequest>,
+) -> impl IntoResponse {
+    http::admin_login_exchange(state, headers, input).await
+}
+async fn logout(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_logout(state, headers).await
 }
 async fn pairings(
     SharedStore(state): SharedStore<AppState>,
@@ -54,14 +76,11 @@ async fn overview(
     SharedStore(state): SharedStore<AppState>,
     headers: HeaderMap,
 ) -> loco_rs::Result<axum::response::Response> {
-    let Json(value) = http::admin_overview(state, headers)
-        .await
-        .map_err(|error| {
-            let error = error.0;
-            loco_rs::Error::CustomError(
-                error.status(),
-                ErrorDetail::new(error.code(), error.message()),
-            )
-        })?;
-    format::json(value)
+    http::admin_overview(state, headers).await.map_err(|error| {
+        let error = error.0;
+        loco_rs::Error::CustomError(
+            error.status(),
+            ErrorDetail::new(error.code(), error.message()),
+        )
+    })
 }

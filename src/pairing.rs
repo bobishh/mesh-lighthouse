@@ -17,10 +17,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "owner_auth_tests.rs"]
+mod owner_auth_tests;
+
 use crate::ProvisioningCommit;
 
 pub const CONTROL_DOMAIN: &str = "MESH-LIGHTHOUSE/1";
 const MAX_AGE_SECONDS: u64 = 600;
+const LOGIN_TTL_SECONDS: u64 = 5 * 60;
+const MAX_PENDING_LOGINS: usize = 128;
 const MAX_SCOPES: usize = 16;
 
 #[derive(Clone)]
@@ -40,6 +46,10 @@ struct PairingState {
     records: HashMap<String, PairingRecord>,
     #[serde(skip)]
     sessions: HashMap<String, AdminSession>,
+    #[serde(skip)]
+    login_challenges: HashMap<String, LoginChallenge>,
+    #[serde(skip)]
+    login_codes: HashMap<String, LoginCode>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -95,6 +105,24 @@ pub struct ProvisionRequest {
 struct AdminSession {
     csrf: String,
     expires_at: u64,
+    person_id: Option<String>,
+    display_name: String,
+    operator: bool,
+}
+
+#[derive(Clone)]
+struct LoginChallenge {
+    nonce: String,
+    intent_cookie: String,
+    expires_at: u64,
+}
+
+#[derive(Clone)]
+struct LoginCode {
+    person_id: String,
+    display_name: String,
+    intent_cookie: String,
+    expires_at: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -112,10 +140,34 @@ pub struct LoginRequest {
     pub secret: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginExchangeRequest {
+    pub code: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionResponse {
     pub csrf_token: String,
+    pub person_id: Option<String>,
+    pub display_name: String,
+    pub operator: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginChallengeResponse {
+    pub challenge_id: String,
+    pub match_url: String,
+    pub expires_at: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginProofResponse {
+    pub code: String,
+    pub redirect_url: String,
 }
 
 impl PairingService {
@@ -766,9 +818,190 @@ impl PairingService {
             AdminSession {
                 csrf: csrf.clone(),
                 expires_at: now_seconds() + 8 * 60 * 60,
+                person_id: None,
+                display_name: "Operator".into(),
+                operator: true,
             },
         );
         Ok((cookie, csrf))
+    }
+
+    pub fn begin_login(
+        &self,
+        match_origin: &str,
+    ) -> Result<(String, LoginChallengeResponse), PairingError> {
+        let now = now_seconds();
+        let challenge_id = random_token(24);
+        let nonce = random_token(32);
+        let intent_cookie = random_token(32);
+        let expires_at = now + LOGIN_TTL_SECONDS;
+        let mut url = reqwest::Url::parse(match_origin)
+            .map_err(|_| PairingError::Invalid("Invalid Match origin"))?;
+        if url.origin().ascii_serialization() != match_origin
+            || !matches!(url.scheme(), "https" | "http")
+        {
+            return Err(PairingError::Invalid("Invalid Match origin"));
+        }
+        url.set_path("/login");
+        url.set_query(None);
+        url.set_fragment(None);
+        url.query_pairs_mut()
+            .append_pair("keeper", &self.origin)
+            .append_pair("challenge", &challenge_id);
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        prune_login_state(&mut state, now);
+        if state.login_challenges.len() + state.login_codes.len() >= MAX_PENDING_LOGINS {
+            return Err(PairingError::Unavailable);
+        }
+        state.login_challenges.insert(
+            challenge_id.clone(),
+            LoginChallenge {
+                nonce,
+                intent_cookie: intent_cookie.clone(),
+                expires_at,
+            },
+        );
+        Ok((
+            intent_cookie,
+            LoginChallengeResponse {
+                challenge_id,
+                match_url: url.to_string(),
+                expires_at,
+            },
+        ))
+    }
+
+    pub fn login_challenge(&self, id: &str) -> Result<SignedEnvelope<Value>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        prune_login_state(&mut state, now_seconds());
+        let challenge = state
+            .login_challenges
+            .get(id)
+            .ok_or(PairingError::NotFound)?;
+        let now = now_seconds();
+        let expires_at = challenge.expires_at;
+        let nonce = challenge.nonce.clone();
+        sign_json_envelope(
+            &self.service_seed,
+            json!({
+                "kind":"lighthouse-login-challenge", "version":1,
+                "challengeId":id, "nonce":nonce,
+                "servicePersonId":self.service_identity.person_id,
+                "serviceDeviceId":self.service_device_id, "serviceOrigin":self.origin,
+                "issuedAt":now, "expiresAt":expires_at,
+            }),
+            &self.service_device_id,
+            CONTROL_DOMAIN,
+        )
+        .map_err(|_| PairingError::Unavailable)
+    }
+
+    pub fn prove_login(
+        &self,
+        request: ControllerRequest,
+        id: &str,
+    ) -> Result<LoginProofResponse, PairingError> {
+        let now = now_seconds();
+        self.verify_controller(&request)?;
+        let payload = &request.signed.payload;
+        if payload["kind"] != "lighthouse-login-proof"
+            || payload["version"] != 1
+            || payload["protocolVersion"] != 1
+            || payload["challengeId"] != id
+            || payload["servicePersonId"] != self.service_identity.person_id
+            || payload["serviceOrigin"] != self.origin
+            || payload["controllerPersonId"] != request.identity.person_id
+            || payload["controllerDeviceId"] != request.device_id
+        {
+            return Err(PairingError::Invalid(
+                "Signed login proof identity or challenge mismatch",
+            ));
+        }
+        let issued = payload["issuedAt"]
+            .as_u64()
+            .ok_or(PairingError::Invalid("Missing issuedAt"))?;
+        let expires = payload["expiresAt"]
+            .as_u64()
+            .ok_or(PairingError::Invalid("Missing expiresAt"))?;
+        let operation = string_field(payload, "operationId")?;
+        if issued > now + 30
+            || now.saturating_sub(issued) > LOGIN_TTL_SECONDS
+            || expires <= now
+            || expires > issued + LOGIN_TTL_SECONDS
+            || operation.len() > 128
+            || URL_SAFE_NO_PAD
+                .decode(operation)
+                .map_or(true, |bytes| bytes.len() < 16)
+        {
+            return Err(PairingError::Expired);
+        }
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        prune_login_state(&mut state, now);
+        let challenge = state
+            .login_challenges
+            .get(id)
+            .ok_or(PairingError::NotFound)?;
+        if challenge.expires_at <= now
+            || expires > challenge.expires_at
+            || payload["challengeNonce"] != challenge.nonce
+        {
+            return Err(PairingError::Expired);
+        }
+        let intent_cookie = challenge.intent_cookie.clone();
+        state.login_challenges.remove(id);
+        let code = random_token(32);
+        state.login_codes.insert(
+            code.clone(),
+            LoginCode {
+                person_id: request.identity.person_id,
+                display_name: request.identity.display_name,
+                intent_cookie,
+                expires_at: now + LOGIN_TTL_SECONDS,
+            },
+        );
+        Ok(LoginProofResponse {
+            code: code.clone(),
+            redirect_url: format!("{}/admin/#login={code}", self.origin),
+        })
+    }
+
+    pub fn exchange_login(
+        &self,
+        code: &str,
+        intent_cookie: &str,
+    ) -> Result<(String, SessionResponse), PairingError> {
+        let now = now_seconds();
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        prune_login_state(&mut state, now);
+        let login = state.login_codes.get(code).ok_or(PairingError::Forbidden)?;
+        if login.expires_at <= now
+            || !constant_time_eq(login.intent_cookie.as_bytes(), intent_cookie.as_bytes())
+        {
+            return Err(PairingError::Forbidden);
+        }
+        let login = state
+            .login_codes
+            .remove(code)
+            .ok_or(PairingError::Forbidden)?;
+        let cookie = random_token(32);
+        let csrf = random_token(32);
+        let session = SessionResponse {
+            csrf_token: csrf.clone(),
+            person_id: Some(login.person_id.clone()),
+            display_name: login.display_name.clone(),
+            operator: false,
+        };
+        state.sessions.insert(
+            cookie.clone(),
+            AdminSession {
+                csrf,
+                expires_at: now + 8 * 60 * 60,
+                person_id: Some(login.person_id),
+                display_name: login.display_name,
+                operator: false,
+            },
+        );
+        Ok((cookie, session))
     }
 
     pub fn service_fingerprint(&self) -> String {
@@ -781,7 +1014,39 @@ impl PairingService {
         let session = state.sessions.get(cookie).ok_or(PairingError::Forbidden)?;
         Ok(SessionResponse {
             csrf_token: session.csrf.clone(),
+            person_id: session.person_id.clone(),
+            display_name: session.display_name.clone(),
+            operator: session.operator,
         })
+    }
+
+    pub fn session_person_id(&self, cookie: &str) -> Result<Option<String>, PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        self.require_session(&mut state, cookie, None)?;
+        Ok(state
+            .sessions
+            .get(cookie)
+            .and_then(|session| session.person_id.clone()))
+    }
+
+    pub fn logout(&self, cookie: &str, csrf: &str) -> Result<(), PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        self.require_session(&mut state, cookie, Some(csrf))?;
+        state.sessions.remove(cookie);
+        Ok(())
+    }
+
+    pub fn require_operator(&self, cookie: &str, csrf: Option<&str>) -> Result<(), PairingError> {
+        let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
+        self.require_session(&mut state, cookie, csrf)?;
+        if !state
+            .sessions
+            .get(cookie)
+            .is_some_and(|session| session.operator)
+        {
+            return Err(PairingError::Forbidden);
+        }
+        Ok(())
     }
 
     pub fn fingerprint(public_key: &str) -> String {
@@ -791,15 +1056,20 @@ impl PairingService {
     pub fn admin_list(&self, cookie: &str) -> Result<Vec<PairingRecord>, PairingError> {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         self.require_session(&mut state, cookie, None)?;
+        let owner = state
+            .sessions
+            .get(cookie)
+            .and_then(|session| session.person_id.as_deref());
         Ok(state
             .records
             .values()
             .filter(|record| {
-                record.expires_at > now_seconds()
-                    || record
-                        .provisioning
-                        .as_ref()
-                        .is_some_and(|provisioning| provisioning.status == "active")
+                owner.is_none_or(|person_id| record.controller.person_id == person_id)
+                    && (record.expires_at > now_seconds()
+                        || record
+                            .provisioning
+                            .as_ref()
+                            .is_some_and(|provisioning| provisioning.status == "active"))
             })
             .cloned()
             .collect())
@@ -814,6 +1084,13 @@ impl PairingService {
     ) -> Result<PairingRecord, PairingError> {
         let mut state = self.state.lock().map_err(|_| PairingError::Unavailable)?;
         self.require_session(&mut state, cookie, Some(csrf))?;
+        if !state
+            .sessions
+            .get(cookie)
+            .is_some_and(|session| session.operator)
+        {
+            return Err(PairingError::Forbidden);
+        }
         let record = state.records.get(id).ok_or(PairingError::NotFound)?;
         if record.expires_at <= now_seconds() {
             return Err(PairingError::Expired);
@@ -985,6 +1262,13 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+fn prune_login_state(state: &mut PairingState, now: u64) {
+    state
+        .login_challenges
+        .retain(|_, challenge| challenge.expires_at > now);
+    state.login_codes.retain(|_, code| code.expires_at > now);
+    state.sessions.retain(|_, session| session.expires_at > now);
 }
 fn random_token(length: usize) -> String {
     let mut bytes = vec![0; length];

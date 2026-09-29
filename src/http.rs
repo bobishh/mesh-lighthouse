@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::pairing::{
-    ControllerRequest, LoginRequest, PairingError, PairingService, ProvisionedScope,
-    SessionResponse,
+    ControllerRequest, LoginExchangeRequest, LoginRequest, PairingError, PairingService,
+    ProvisionedScope, SessionResponse,
 };
 use crate::provisioning::ProvisioningService;
 use crate::{keeper::KeeperHost, replication::RuntimeOverview};
@@ -321,6 +321,17 @@ pub(crate) async fn operator_test_router(
     discovery: Discovery,
     keeper: KeeperHost,
 ) -> axum::Router {
+    operator_test_router_with_runtime(directory, discovery, keeper, RuntimeOverview::default())
+        .await
+}
+
+#[cfg(test)]
+pub(crate) async fn operator_test_router_with_runtime(
+    directory: &Path,
+    discovery: Discovery,
+    keeper: KeeperHost,
+    replication: RuntimeOverview,
+) -> axum::Router {
     for name in ["inbox", "results", "captcha-used"] {
         fs::create_dir_all(directory.join(name)).unwrap();
     }
@@ -341,7 +352,7 @@ pub(crate) async fn operator_test_router(
             discovery: Some(discovery),
             cors_origins: Arc::new(Vec::new()),
             keeper: Some(keeper),
-            replication: RuntimeOverview::default(),
+            replication,
         },
         Vec::new(),
     )
@@ -497,15 +508,190 @@ pub(crate) async fn admin_login(
         .and_then(|d| d.descriptor["publicOrigin"].as_str())
         .is_some_and(|origin| origin.starts_with("https://"));
     let secure_suffix = if secure { "; Secure" } else { "" };
-    let mut response = Json(SessionResponse { csrf_token: csrf }).into_response();
+    let mut response = Json(SessionResponse {
+        csrf_token: csrf,
+        person_id: None,
+        display_name: "Operator".into(),
+        operator: true,
+    })
+    .into_response();
     response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin={cookie}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=28800{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+pub(crate) async fn admin_login_challenge(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    enforce_same_origin(&state, &headers)?;
+    let match_origin = state
+        .cors_origins
+        .first()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let (intent, challenge) = pairings
+        .begin_login(match_origin)
+        .map_err(PairingResponseError)?;
+    let secure = state
+        .discovery
+        .as_ref()
+        .and_then(|d| d.descriptor["publicOrigin"].as_str())
+        .is_some_and(|origin| origin.starts_with("https://"));
+    let secure_suffix = if secure { "; Secure" } else { "" };
+    let mut response = Json(challenge).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_login_intent={intent}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=300{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+pub(crate) async fn login_challenge(
+    state: AppState,
+    id: String,
+) -> Result<Response, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let envelope = pairings
+        .login_challenge(&id)
+        .map_err(PairingResponseError)?;
+    let mut response = Json(
+        serde_json::to_value(envelope)
+            .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+pub(crate) async fn login_proof(
+    state: AppState,
+    request: ControllerRequest,
+) -> Result<Response, PairingResponseError> {
+    let id = request.signed.payload["challengeId"]
+        .as_str()
+        .ok_or(PairingResponseError(PairingError::Invalid(
+            "Missing challengeId",
+        )))?
+        .to_owned();
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let response = pairings
+        .prove_login(request, &id)
+        .map_err(PairingResponseError)?;
+    let mut response = Json(
+        serde_json::to_value(response)
+            .map_err(|_| PairingResponseError(PairingError::Unavailable))?,
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+pub(crate) async fn admin_login_exchange(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    input: LoginExchangeRequest,
+) -> Result<Response, PairingResponseError> {
+    enforce_same_origin(&state, &headers)?;
+    let intent =
+        admin_intent_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let (cookie, session) = pairings
+        .exchange_login(&input.code, intent)
+        .map_err(PairingResponseError)?;
+    let secure = state
+        .discovery
+        .as_ref()
+        .and_then(|d| d.descriptor["publicOrigin"].as_str())
+        .is_some_and(|origin| origin.starts_with("https://"));
+    let secure_suffix = if secure { "; Secure" } else { "" };
+    let mut response = Json(session).into_response();
+    response.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin={cookie}; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=28800{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_login_intent=; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=0{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+pub(crate) async fn admin_logout(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, PairingResponseError> {
+    enforce_same_origin(&state, &headers)?;
+    let pairings = state
+        .pairings
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    pairings
+        .logout(cookie, csrf)
+        .map_err(PairingResponseError)?;
+    let secure = state
+        .discovery
+        .as_ref()
+        .and_then(|d| d.descriptor["publicOrigin"].as_str())
+        .is_some_and(|origin| origin.starts_with("https://"));
+    let secure_suffix = if secure { "; Secure" } else { "" };
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&format!("mesh_lighthouse_admin=; HttpOnly; SameSite=Strict; Path=/admin/api; Max-Age=0{secure_suffix}")).map_err(|_| PairingResponseError(PairingError::Unavailable))?);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+fn enforce_same_origin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), PairingResponseError> {
+    if headers.contains_key(header::ORIGIN) {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(PairingResponseError(PairingError::Forbidden))?;
+        let service_origin = state
+            .discovery
+            .as_ref()
+            .and_then(|d| d.descriptor["publicOrigin"].as_str());
+        if Some(origin) != service_origin {
+            return Err(PairingResponseError(PairingError::Forbidden));
+        }
+    }
+    Ok(())
+}
+
+fn admin_intent_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|pair| pair.trim().strip_prefix("mesh_lighthouse_login_intent="))
 }
 
 pub(crate) async fn admin_list(
     state: AppState,
     headers: axum::http::HeaderMap,
-) -> Result<Json<Value>, PairingResponseError> {
+) -> Result<Response, PairingResponseError> {
     let pairings = state
         .pairings
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
@@ -520,7 +706,11 @@ pub(crate) async fn admin_list(
         "futureBoards":record.offer.pointer("/body/policy/futureBoards").and_then(Value::as_bool).unwrap_or(false),
         "operatorApproved":record.operator_approved,"controllerApproved":record.controller_approved,
     })).collect::<Vec<_>>();
-    Ok(Json(json!({"pairings":rows})))
+    let mut response = Json(json!({"pairings":rows})).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 pub(crate) async fn admin_session(
@@ -544,7 +734,7 @@ pub(crate) async fn admin_session(
 pub(crate) async fn admin_overview(
     state: AppState,
     headers: axum::http::HeaderMap,
-) -> Result<Json<Value>, PairingResponseError> {
+) -> Result<Response, PairingResponseError> {
     let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
     let pairings = state
         .pairings
@@ -555,9 +745,19 @@ pub(crate) async fn admin_overview(
         .keeper
         .as_ref()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
-    let mut overview = keeper
-        .admin_overview()
-        .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
+    let owner_id = pairings
+        .session_person_id(cookie)
+        .map_err(PairingResponseError)?;
+    let operator = pairings.require_operator(cookie, None).is_ok();
+    if !operator && owner_id.is_none() {
+        return Err(PairingResponseError(PairingError::Forbidden));
+    }
+    let mut overview = if let Some(owner_id) = owner_id.as_deref() {
+        keeper.owner_overview(owner_id)
+    } else {
+        keeper.admin_overview()
+    }
+    .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
     let runtime = state.replication.snapshot();
     let mut active_peers = 0usize;
     let mut last_success_at = None::<u64>;
@@ -575,6 +775,37 @@ pub(crate) async fn admin_overview(
         }
         board["replication"] =
             serde_json::to_value(status).unwrap_or_else(|_| json!({"state":"unknown"}));
+    }
+    let target_workspace_id = keeper
+        .configuration()
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+        .workspace_id;
+    let target_is_owned = boards
+        .iter()
+        .any(|board| board["workspaceId"] == target_workspace_id);
+    let state_name = if active_peers > 0 {
+        "connected"
+    } else if boards
+        .iter()
+        .any(|board| board["replication"]["state"] == "retrying")
+    {
+        "retrying"
+    } else if boards
+        .iter()
+        .any(|board| board["replication"]["state"] == "connecting")
+    {
+        "connecting"
+    } else {
+        "idle"
+    };
+    overview["replication"] = json!({"state":state_name,"activePeers":active_peers,"lastSuccessAt":last_success_at,"lastErrorCategory":last_error_category});
+    if owner_id.is_some() && !target_is_owned {
+        overview["triggers"] = json!([]);
+        let mut response = Json(overview).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(response);
     }
     let inbox_entries = fs::read_dir(state.inbox.directory.as_ref())
         .map_err(|_| PairingResponseError(PairingError::Unavailable))?;
@@ -616,38 +847,21 @@ pub(crate) async fn admin_overview(
                 .map(|duration| duration.as_secs()),
         );
     }
-    let state_name = if active_peers > 0 {
-        "connected"
-    } else if boards
-        .iter()
-        .any(|board| board["replication"]["state"] == "retrying")
-    {
-        "retrying"
-    } else if boards
-        .iter()
-        .any(|board| board["replication"]["state"] == "connecting")
-    {
-        "connecting"
-    } else {
-        "idle"
-    };
     overview["triggers"] = json!([{
         "id":"jev-intake",
         "name":"JEV intake",
         "configured":std::env::var("JEV_API_KEY").is_ok_and(|key| !key.trim().is_empty()),
         "model":JEV_MODEL,
-        "targetWorkspaceId":keeper.configuration().map_err(|_| PairingResponseError(PairingError::Unavailable))?.workspace_id,
+        "targetWorkspaceId":target_workspace_id,
         "pendingCount":pending_count,
         "outcomes":outcomes,
         "lastResultAt":last_result_at,
     }]);
-    overview["replication"] = json!({
-        "state":state_name,
-        "activePeers":active_peers,
-        "lastSuccessAt":last_success_at,
-        "lastErrorCategory":last_error_category,
-    });
-    Ok(Json(overview))
+    let mut response = Json(overview).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 pub(crate) async fn admin_decision(
@@ -655,7 +869,7 @@ pub(crate) async fn admin_decision(
     id: String,
     headers: axum::http::HeaderMap,
     input: Value,
-) -> Result<Json<Value>, PairingResponseError> {
+) -> Result<Response, PairingResponseError> {
     let pairings = state
         .pairings
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
@@ -676,9 +890,11 @@ pub(crate) async fn admin_decision(
     let record = pairings
         .admin_decision(&id, cookie, csrf, approved)
         .map_err(PairingResponseError)?;
-    Ok(Json(
-        json!({"pairingId":record.id,"status":pairings.status_json(&record.id).map_err(PairingResponseError)?}),
-    ))
+    let mut response = Json(json!({"pairingId":record.id,"status":pairings.status_json(&record.id).map_err(PairingResponseError)?})).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 fn admin_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {

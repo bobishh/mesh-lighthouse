@@ -397,6 +397,7 @@ pub async fn provision_existing_identity(
             workspace_ids: scope_ids.clone(),
             snapshot_hash: URL_SAFE_NO_PAD.encode(Sha256::digest(&original_snapshot_bytes)),
             future_boards,
+            controller_person_id: None,
         };
         if let Err(error) = activate(staged, commit) {
             return Err(error.into());

@@ -329,6 +329,9 @@ impl Drop for TestKeeper {
     }
 }
 
+#[path = "keeper_owner_tests.rs"]
+mod owner_tests;
+
 #[tokio::test]
 async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_jev_without_invites()
 {
@@ -348,6 +351,7 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
                 workspace_ids: vec!["second-board".into()],
                 snapshot_hash: "overview-snapshot".into(),
                 future_boards: false,
+                controller_person_id: Some(keeper.owner.person_id.clone()),
             },
         )
         .unwrap();
@@ -506,6 +510,10 @@ fn approved_owner_offer_activates_and_persists_scope_with_shared_service_identit
         .iter()
         .find(|scope| scope.workspace_id == "second-board")
         .unwrap();
+    assert_eq!(
+        added.controller_person_id.as_deref(),
+        Some(keeper.owner.person_id.as_str())
+    );
     assert_eq!(added.device_id, keeper.keeper.device_id);
     assert_eq!(added.iroh_secret, keeper.keeper.endpoint_secret);
     assert_eq!(added.identity_seed, keeper.keeper.identity_seed);
@@ -653,6 +661,7 @@ fn provisioned_scopes_activate_atomically_and_retry_by_durable_marker() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
     };
     let mut orphaned = vec![keeper.staged_scope("selected-board-a")];
     super::relocate_provisioned_scope_dirs(&keeper.directory, &mut orphaned, &commit).unwrap();
@@ -730,6 +739,7 @@ fn failed_scope_validation_never_activates_a_subset_of_provisioned_scopes() {
         workspace_ids: vec!["selected-board-a".into(), "selected-board-b".into()],
         snapshot_hash: "snapshot-test".into(),
         future_boards: false,
+        controller_person_id: Some(keeper.owner.person_id.clone()),
     };
 
     assert!(

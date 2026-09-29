@@ -32,6 +32,7 @@ impl ProvisioningService {
         future_boards: bool,
     ) -> Result<Vec<ProvisionedScope>, String> {
         let invitation_id = invitation.invitation_id.clone();
+        let controller_person_id = invitation.issuer_person_id.clone();
         let expected_commit = ProvisioningCommit {
             pairing_id: pairing_id.into(),
             operation_id: operation_id.into(),
@@ -40,6 +41,7 @@ impl ProvisioningService {
             workspace_ids: workspace_ids.clone(),
             snapshot_hash: String::new(),
             future_boards,
+            controller_person_id: Some(controller_person_id.clone()),
         };
         if let Some(previous) = self.host.provisioning_commit(pairing_id)? {
             if previous.pairing_id != expected_commit.pairing_id
@@ -48,6 +50,10 @@ impl ProvisioningService {
                 || previous.invitation_id != expected_commit.invitation_id
                 || previous.workspace_ids != expected_commit.workspace_ids
                 || previous.future_boards != expected_commit.future_boards
+                || previous
+                    .controller_person_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != controller_person_id)
                 || previous.snapshot_hash.is_empty()
             {
                 return Err("Provisioning retry conflicts with durable activation".into());
@@ -71,7 +77,17 @@ impl ProvisioningService {
             &config,
             &self.node,
             &service_directory,
-            move |staged, commit| host.activate_provisioned_scopes(staged, commit),
+            move |staged, mut commit| {
+                if commit
+                    .controller_person_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != controller_person_id)
+                {
+                    return Err("Provisioning controller differs from accepted invitation".into());
+                }
+                commit.controller_person_id = Some(controller_person_id);
+                host.activate_provisioned_scopes(staged, commit)
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
