@@ -119,7 +119,29 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
         if received.grants.len() != ids.len() || received.mesh_workspaces.len() != ids.len() {
             return Err("Workspace invitation must contain every selected grant and scope".into());
         }
-        let entries = decode_workspace_set(&URL_SAFE_NO_PAD.decode(&received.snapshot)?, &ids)?;
+        let mut entries = decode_workspace_set(&URL_SAFE_NO_PAD.decode(&received.snapshot)?, &ids)?;
+        let proof_cache = directory.join("proof-pages");
+        create_private_directory(&proof_cache)?;
+        for entry in &mut entries {
+            let Some(authorization) = entry.authorization.as_ref().filter(|value| {
+                value.get("kind").and_then(Value::as_str)
+                    == Some("workspace-authorization-manifest")
+            }) else {
+                continue;
+            };
+            let candidate = URL_SAFE_NO_PAD.decode(&entry.bytes)?;
+            entry.authorization = Some(
+                resolve_initial_authorization(
+                    &entry.id,
+                    &invite.secret,
+                    &candidate,
+                    authorization,
+                    &proof_cache,
+                    &session,
+                )
+                .await?,
+            );
+        }
         let mut configs = Vec::new();
         for (index, workspace) in invite.workspaces.iter().enumerate() {
             let mut scoped_invite = invite.clone();
@@ -151,6 +173,7 @@ pub async fn join(raw_invite: &str, directory: PathBuf) -> Result<(), BoxError> 
             &URL_SAFE_NO_PAD.decode(serde_json::from_slice::<JoinResponse>(&accepted)?.snapshot)?,
         )?;
         session.exchange(&ack, Duration::from_secs(20)).await?;
+        let _ = fs::remove_dir_all(proof_cache);
         Ok::<_, BoxError>(config)
     }
     .await;
