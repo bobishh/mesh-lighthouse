@@ -6,7 +6,7 @@ use std::{
 };
 
 use automerge::{
-    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc,
+    ActorId, AutoCommit, AutoSerde, ObjId, ObjType, ROOT, ReadDoc, ScalarValue,
     transaction::{CommitOptions, Transactable},
 };
 use match_authority::{admit_match_candidate, prepare_match_write_authority};
@@ -315,7 +315,7 @@ impl MatchScopeStore {
         )?;
         put_text(&mut document, &item, "body", body)?;
         document
-            .put(&item, "deleted", false)
+            .put(&item, "archivedAt", ScalarValue::Null)
             .map_err(|error| error.to_string())?;
         put_text(&mut document, &item, "createdAt", &now)?;
         put_text(&mut document, &item, "updatedAt", &now)?;
