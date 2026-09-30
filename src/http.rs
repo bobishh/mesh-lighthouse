@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::cors_settings::CorsSettings;
 use crate::pairing::{
     ControllerRequest, LoginExchangeRequest, LoginRequest, PairingError, PairingService,
     ProvisionedScope, SessionResponse,
@@ -58,9 +59,15 @@ pub(crate) struct AppState {
     discovery: Option<Discovery>,
     pairings: Option<PairingService>,
     provisioner: Option<Arc<ProvisioningService>>,
-    cors_origins: Arc<Vec<String>>,
+    cors_settings: CorsSettings,
     keeper: Option<KeeperHost>,
     replication: RuntimeOverview,
+}
+
+impl AppState {
+    pub(crate) fn cors_settings(&self) -> CorsSettings {
+        self.cors_settings.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -268,19 +275,7 @@ pub async fn serve(
         .filter(|origin| !origin.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let mut allowed_origins = Vec::with_capacity(cors_origins.len());
-    for origin in &cors_origins {
-        let parsed = Url::parse(origin)?;
-        let loopback = parsed
-            .host_str()
-            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
-        if parsed.origin().ascii_serialization() != *origin
-            || (parsed.scheme() != "https" && !(loopback && parsed.scheme() == "http"))
-        {
-            return Err(format!("Invalid configured Lighthouse CORS origin: {origin}").into());
-        }
-        allowed_origins.push(origin.parse::<HeaderValue>()?);
-    }
+    let cors_settings = CorsSettings::open(directory.join("cors-origins.json"), cors_origins)?;
     let pairings = discovery.as_ref().and_then(|item| item.pairings.clone());
     let provisioner = discovery.as_ref().and_then(|item| item.provisioner.clone());
     let state = AppState {
@@ -297,22 +292,19 @@ pub async fn serve(
         discovery,
         pairings,
         provisioner,
-        cors_origins: Arc::new(cors_origins),
+        cors_settings,
         keeper,
         replication,
     };
     let processing_inbox = state.inbox.clone();
     tokio::spawn(async move { process_loop(processing_inbox, lead_sender).await });
-    crate::app::serve(state, address, allowed_origins).await?;
+    crate::app::serve(state, address).await?;
     Ok(())
 }
 
 #[cfg(test)]
-async fn http_app(
-    state: AppState,
-    allowed_origins: Vec<HeaderValue>,
-) -> loco_rs::Result<axum::Router> {
-    crate::app::router(state, allowed_origins).await
+async fn http_app(state: AppState) -> loco_rs::Result<axum::Router> {
+    crate::app::router(state).await
 }
 
 #[cfg(test)]
@@ -335,27 +327,24 @@ pub(crate) async fn operator_test_router_with_runtime(
     for name in ["inbox", "results", "captcha-used"] {
         fs::create_dir_all(directory.join(name)).unwrap();
     }
-    http_app(
-        AppState {
-            inbox: Inbox {
-                directory: Arc::new(directory.join("inbox")),
-                results: Arc::new(directory.join("results")),
-                write_lock: Arc::new(Mutex::new(())),
-            },
-            captcha: Captcha {
-                secret: Arc::new([1; 32]),
-                used: Arc::new(directory.join("captcha-used")),
-            },
-            ingest_slots: Arc::new(Semaphore::new(1)),
-            pairings: discovery.pairings.clone(),
-            provisioner: None,
-            discovery: Some(discovery),
-            cors_origins: Arc::new(Vec::new()),
-            keeper: Some(keeper),
-            replication,
+    http_app(AppState {
+        inbox: Inbox {
+            directory: Arc::new(directory.join("inbox")),
+            results: Arc::new(directory.join("results")),
+            write_lock: Arc::new(Mutex::new(())),
         },
-        Vec::new(),
-    )
+        captcha: Captcha {
+            secret: Arc::new([1; 32]),
+            used: Arc::new(directory.join("captcha-used")),
+        },
+        ingest_slots: Arc::new(Semaphore::new(1)),
+        pairings: discovery.pairings.clone(),
+        provisioner: None,
+        discovery: Some(discovery),
+        cors_settings: CorsSettings::open(directory.join("cors-origins.json"), Vec::new()).unwrap(),
+        keeper: Some(keeper),
+        replication,
+    })
     .await
     .unwrap()
 }
@@ -532,8 +521,8 @@ pub(crate) async fn admin_login_challenge(
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
     enforce_same_origin(&state, &headers)?;
     let match_origin = state
-        .cors_origins
-        .first()
+        .cors_settings
+        .required_origin()
         .ok_or(PairingResponseError(PairingError::Unavailable))?;
     let (intent, challenge) = pairings
         .begin_login(match_origin)
@@ -731,6 +720,65 @@ pub(crate) async fn admin_session(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+pub(crate) struct CorsSettingsInput {
+    origins: Vec<String>,
+}
+
+pub(crate) async fn admin_cors_settings(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, PairingResponseError> {
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    pairings
+        .require_operator(cookie, None)
+        .map_err(PairingResponseError)?;
+    let mut response = Json(json!({
+        "origins": state.cors_settings.origins(),
+        "requiredOrigin": state.cors_settings.required_origin(),
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+pub(crate) async fn update_admin_cors_settings(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    input: CorsSettingsInput,
+) -> Result<Response, PairingResponseError> {
+    enforce_same_origin(&state, &headers)?;
+    let pairings = state
+        .pairings
+        .as_ref()
+        .ok_or(PairingResponseError(PairingError::Unavailable))?;
+    let cookie = admin_cookie(&headers).ok_or(PairingResponseError(PairingError::Forbidden))?;
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(PairingResponseError(PairingError::Forbidden))?;
+    pairings
+        .require_operator(cookie, Some(csrf))
+        .map_err(PairingResponseError)?;
+    state
+        .cors_settings
+        .replace(input.origins)
+        .map_err(|error| {
+            PairingResponseError(if error.kind() == std::io::ErrorKind::InvalidInput {
+                PairingError::Invalid("Invalid allowed origins")
+            } else {
+                PairingError::Unavailable
+            })
+        })?;
+    admin_cors_settings(state, headers).await
+}
+
 pub(crate) async fn admin_overview(
     state: AppState,
     headers: axum::http::HeaderMap,
@@ -922,7 +970,12 @@ pub(crate) async fn discover(
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
     {
-        if !state.cors_origins.iter().any(|allowed| allowed == origin) {
+        if !state
+            .cors_settings
+            .origins()
+            .iter()
+            .any(|allowed| allowed == origin)
+        {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(json!({
@@ -1882,14 +1935,18 @@ mod tests {
             discovery: Some(discovery),
             pairings: Some(pairing_service.clone()),
             provisioner: None,
-            cors_origins: Arc::new(vec![]),
+            cors_settings: CorsSettings::open(
+                root.join("cors-origins.json"),
+                vec!["https://match.example".into()],
+            )
+            .unwrap(),
             keeper: None,
             replication: RuntimeOverview::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, http_app(state, vec![]).await.unwrap())
+            axum::serve(listener, http_app(state).await.unwrap())
                 .await
                 .unwrap()
         });
@@ -1956,6 +2013,49 @@ mod tests {
             .unwrap()
             .to_owned();
         let login_body: Value = login.json().await.unwrap();
+        let settings_url = format!("{test_origin}/admin/api/settings/cors");
+        assert_eq!(
+            client.get(&settings_url).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(&settings_url)
+                .header(header::COOKIE, &cookie)
+                .json(&json!({"origins":["https://match.example","https://home.example"]}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let updated = client
+            .post(&settings_url)
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", login_body["csrfToken"].as_str().unwrap())
+            .json(&json!({"origins":["https://match.example","https://home.example"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated_body: Value = updated.json().await.unwrap();
+        assert_eq!(
+            updated_body["origins"],
+            json!(["https://match.example", "https://home.example"])
+        );
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("{test_origin}/ingest"))
+            .header(header::ORIGIN, "https://home.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://home.example"
+        );
+        assert!(root.join("cors-origins.json").exists());
         let operator_list = client
             .get(format!("{test_origin}/admin/api/pairings"))
             .header(header::COOKIE, &cookie)
@@ -2192,20 +2292,20 @@ mod tests {
             discovery: Some(Discovery::from_peer(&peer, "https://keeper.example").unwrap()),
             pairings: None,
             provisioner: None,
-            cors_origins: Arc::new(vec!["https://match.example".into()]),
+            cors_settings: CorsSettings::open(
+                root.join("cors-origins.json"),
+                vec!["https://match.example".into()],
+            )
+            .unwrap(),
             keeper: None,
             replication: RuntimeOverview::default(),
         };
-        let allowed_origin = "https://match.example".parse::<HeaderValue>().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                http_app(state, vec![allowed_origin]).await.unwrap(),
-            )
-            .await
-            .unwrap()
+            axum::serve(listener, http_app(state).await.unwrap())
+                .await
+                .unwrap()
         });
 
         let client = reqwest::Client::new();

@@ -24,6 +24,10 @@ pub(crate) fn routes() -> Routes {
         .add("/logout", post(logout))
         .add("/pairings", get(pairings))
         .add("/overview", get(overview))
+        .add(
+            "/settings/cors",
+            get(cors_settings).post(update_cors_settings),
+        )
         .add("/pairings/{id}/decision", post(decision))
 }
 
@@ -83,4 +87,19 @@ async fn overview(
             ErrorDetail::new(error.code(), error.message()),
         )
     })
+}
+
+async fn cors_settings(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    http::admin_cors_settings(state, headers).await
+}
+
+async fn update_cors_settings(
+    SharedStore(state): SharedStore<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<http::CorsSettingsInput>,
+) -> impl IntoResponse {
+    http::update_admin_cors_settings(state, headers, input).await
 }

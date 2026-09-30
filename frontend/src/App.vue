@@ -25,6 +25,7 @@ type Overview = {
   replication: { state: string; activePeers: number; lastSuccessAt?: number | null; lastErrorCategory?: string | null }
 }
 type AdminIdentity = { personId: string | null; displayName: string; operator: boolean }
+type CorsSettings = { origins: string[]; requiredOrigin: string }
 type Pairing = {
   id: string
   comparisonCode: string
@@ -47,6 +48,12 @@ const loading = ref(false)
 const error = ref("")
 const overview = ref<Overview | null>(null)
 const pairings = ref<Pairing[]>([])
+const corsRequired = ref("")
+const corsDraft = ref("")
+const corsLoaded = ref(false)
+const corsSaving = ref(false)
+const corsError = ref("")
+const corsNotice = ref("")
 const pollIntervalMs = 5_000
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let refreshInFlight = false
@@ -107,6 +114,41 @@ function clearIdentity() {
   adminIdentity.value = null
   overview.value = null
   pairings.value = []
+  corsLoaded.value = false
+  corsDraft.value = ""
+}
+
+async function loadCorsSettings() {
+  if (!adminIdentity.value?.operator) return
+  corsError.value = ""
+  try {
+    const settings = await api<CorsSettings>("/admin/api/settings/cors")
+    corsRequired.value = settings.requiredOrigin
+    corsDraft.value = settings.origins.filter(origin => origin !== settings.requiredOrigin).join("\n")
+    corsLoaded.value = true
+  } catch (cause) {
+    corsLoaded.value = false
+    corsError.value = cause instanceof Error ? cause.message : "Could not load allowed origins"
+  }
+}
+
+async function saveCorsSettings() {
+  if (!corsLoaded.value || corsSaving.value) return
+  corsSaving.value = true
+  corsError.value = ""
+  corsNotice.value = ""
+  try {
+    const origins = [corsRequired.value, ...corsDraft.value.split(/\r?\n/).map(origin => origin.trim()).filter(Boolean)]
+    const settings = await api<CorsSettings>("/admin/api/settings/cors", {
+      method: "POST", body: JSON.stringify({ origins }),
+    })
+    corsDraft.value = settings.origins.filter(origin => origin !== settings.requiredOrigin).join("\n")
+    corsNotice.value = "Allowed origins saved"
+  } catch (cause) {
+    corsError.value = cause instanceof Error ? cause.message : "Could not save allowed origins"
+  } finally {
+    corsSaving.value = false
+  }
 }
 
 async function logout() {
@@ -135,6 +177,7 @@ async function exchangeLoginCode() {
     adminIdentity.value = identity
     signedIn.value = true
     await refresh()
+    await loadCorsSettings()
   } catch (cause) {
     clearIdentity()
     error.value = cause instanceof Error ? cause.message : "Could not complete Match sign-in."
@@ -154,6 +197,7 @@ async function restoreSession() {
     adminIdentity.value = response
     signedIn.value = true
     await refresh()
+    await loadCorsSettings()
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 403) {
       clearIdentity()
@@ -179,6 +223,7 @@ async function signIn() {
     sessionUnavailable.value = false
     token.value = ""
     await refresh()
+    await loadCorsSettings()
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "Sign-in failed"
   }
@@ -288,6 +333,22 @@ onUnmounted(() => {
       <p v-if="error" class="admin-notice admin-notice-error" role="status">{{ error }}</p>
 
       <template v-if="signedIn && overview">
+        <section v-if="adminIdentity?.operator" aria-labelledby="settings-title" class="admin-section">
+          <div class="section-heading"><h2 id="settings-title">Settings</h2></div>
+          <form class="keeper-card cors-settings" @submit.prevent="saveCorsSettings">
+            <h3>Allowed website origins</h3>
+            <p class="section-copy">Match sign-in origin stays enabled. Add other websites allowed to reach Lighthouse intake, one HTTPS origin per line.</p>
+            <p class="muted">Match: {{ corsRequired || "Loading…" }}</p>
+            <label class="field-label" for="cors-origins">Additional origins</label>
+            <textarea id="cors-origins" v-model="corsDraft" :disabled="!corsLoaded || corsSaving" rows="3" placeholder="https://example.com"></textarea>
+            <div class="cors-actions">
+              <button class="button button-small button-primary" type="submit" :disabled="!corsLoaded || corsSaving">{{ corsSaving ? "Saving…" : "Save origins" }}</button>
+              <button v-if="!corsLoaded" class="button button-small" type="button" @click="loadCorsSettings">Retry loading</button>
+            </div>
+            <p v-if="corsError" class="admin-notice admin-notice-error" role="alert">{{ corsError }}</p>
+            <p v-if="corsNotice" class="admin-notice" role="status">{{ corsNotice }}</p>
+          </form>
+        </section>
         <section aria-labelledby="keepers-title" class="admin-section">
           <div class="section-heading">
             <div>
@@ -360,4 +421,8 @@ onUnmounted(() => {
 .service-admin-fallback { display: grid; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--soft); }
 .service-admin-fallback summary { color: var(--muted); cursor: pointer; font-weight: 750; }
 .service-admin-fallback input { width: min(360px, 80vw); min-height: var(--control-size); padding: 9px 12px; border: 2px solid var(--line); background: var(--panel); }
+.cors-settings { display: grid; gap: 12px; }
+.cors-settings h3, .cors-settings p { margin: 0; }
+.cors-settings textarea { width: 100%; padding: 10px 12px; border: 2px solid var(--line); background: var(--panel); color: var(--ink); font: inherit; resize: vertical; }
+.cors-actions { display: flex; gap: 10px; }
 </style>

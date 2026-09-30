@@ -19,6 +19,7 @@ test("Given an operator session, when overview changes, then Lighthouse updates 
   } }))
   await page.route("**/admin/api/overview", route => route.fulfill({ json: overview(++reads === 1 ? "idle" : "connected") }))
   await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [] } }))
+  await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
 
   await page.goto("/admin/")
   await expect(page.getByRole("heading", { name: "LIGHTHOUSE", exact: true })).toBeVisible()
@@ -44,6 +45,7 @@ test("Given a live overview, when one poll fails, then prior data stays and next
     return route.fulfill({ json: overview(reads === 1 ? "idle" : "connected") })
   })
   await page.route("**/admin/api/pairings", route => route.fulfill({ json: { pairings: [] } }))
+  await page.route("**/admin/api/settings/cors", route => route.fulfill({ json: { requiredOrigin: "https://match.example", origins: ["https://match.example"] } }))
 
   await page.goto("/admin/")
   await expect(page.getByText("Garden")).toBeVisible()

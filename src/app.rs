@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     extract::Request,
-    http::{HeaderValue, header},
+    http::{HeaderValue, Method, header},
     middleware::{self, Next},
     response::Response,
 };
@@ -26,6 +26,7 @@ use loco_rs::{
     task::Tasks,
 };
 use serde_json::json;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{controllers, http::AppState};
 
@@ -88,11 +89,7 @@ pub(crate) fn frontend_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("frontend/dist"))
 }
 
-async fn boot(
-    state: AppState,
-    address: SocketAddr,
-    origins: Vec<HeaderValue>,
-) -> loco_rs::Result<BootResult> {
+async fn boot(state: AppState, address: SocketAddr) -> loco_rs::Result<BootResult> {
     let assets = frontend_directory();
     // Existing runtime configuration stays in Config.json and LIGHTHOUSE_*.
     // No DB, mailer, queue, request timeout, or replacement auth subsystem.
@@ -104,8 +101,7 @@ async fn boot(
             "host": format!("http://{}", address.ip()),
             "middlewares": {
                 "limit_payload": {"body_limit": "16384"},
-                "cors": {"enable": true, "allow_origins": origins.iter().map(|v| v.to_str().unwrap_or_default()).collect::<Vec<_>>(),
-                    "allow_methods": ["GET", "POST"], "allow_headers": ["content-type"]},
+                "cors": {"enable": false},
                 "logger": {"enable": false},
                 "etag": {"enable": false},
                 "static": {"enable": true, "must_exist": false,
@@ -114,18 +110,25 @@ async fn boot(
             }
         }
     }))?;
-    let result =
+    let mut result =
         LighthouseApp::boot(StartMode::ServerOnly, &Environment::Production, config).await?;
+    let cors_settings = state.cors_settings();
     result.app_context.shared_store.insert(state);
+    result.router = result.router.map(|router| {
+        router.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                    cors_settings.allows(origin)
+                }))
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::CONTENT_TYPE]),
+        )
+    });
     Ok(result)
 }
 
-pub(crate) async fn serve(
-    state: AppState,
-    address: SocketAddr,
-    origins: Vec<HeaderValue>,
-) -> loco_rs::Result<()> {
-    let result = boot(state, address, origins).await?;
+pub(crate) async fn serve(state: AppState, address: SocketAddr) -> loco_rs::Result<()> {
+    let result = boot(state, address).await?;
     println!("Lighthouse HTTP listening on {address}");
     loco_rs::boot::start::<LighthouseApp>(
         result,
@@ -139,8 +142,8 @@ pub(crate) async fn serve(
 }
 
 #[cfg(test)]
-pub(crate) async fn router(state: AppState, origins: Vec<HeaderValue>) -> loco_rs::Result<Router> {
-    boot(state, "127.0.0.1:0".parse().unwrap(), origins)
+pub(crate) async fn router(state: AppState) -> loco_rs::Result<Router> {
+    boot(state, "127.0.0.1:0".parse().unwrap())
         .await?
         .router
         .ok_or(loco_rs::Error::InternalServerError)

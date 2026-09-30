@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 mod app;
 mod controllers;
+mod cors_settings;
 mod http;
 mod join;
 mod keeper;
