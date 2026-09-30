@@ -166,37 +166,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_path_buf();
         let address: SocketAddr = bind.parse()?;
         let (lead_sender, mut lead_receiver) = tokio::sync::mpsc::channel::<http::LeadRequest>(16);
-        let (mut lead_store, lead_peer) = host.primary_store()?;
+        let intake_host = host.clone();
         let lead_seed = device_seed;
         tokio::spawn(async move {
             while let Some(request) = lead_receiver.recv().await {
-                let store = &mut lead_store;
-                let result = store
-                    .create_chat_message(
-                        &lead_peer,
-                        &lead_seed,
-                        &request.lead_id,
-                        &format!("New lead\n\n{}\n\n{}", request.body, request.verdict),
-                    )
-                    .and_then(|_| {
-                        if request.create_card {
-                            store
-                                .create_lead(
-                                    &lead_peer,
-                                    &lead_seed,
-                                    LeadDraft {
-                                        id: &request.lead_id,
-                                        company: &request.company,
-                                        role: &request.role,
-                                        job_url: &request.job_url,
-                                        body: &request.body,
-                                    },
-                                )
-                                .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    });
+                let result = intake_host.intake_store().and_then(|target| {
+                    let (_, mut store, lead_peer) =
+                        target.ok_or("No job-search board in keeper scopes")?;
+                    store
+                        .create_chat_message(
+                            &lead_peer,
+                            &lead_seed,
+                            &request.lead_id,
+                            &format!("New lead\n\n{}\n\n{}", request.body, request.verdict),
+                        )
+                        .and_then(|_| {
+                            if request.create_card {
+                                store
+                                    .create_lead(
+                                        &lead_peer,
+                                        &lead_seed,
+                                        LeadDraft {
+                                            id: &request.lead_id,
+                                            company: &request.company,
+                                            role: &request.role,
+                                            job_url: &request.job_url,
+                                            body: &request.body,
+                                        },
+                                    )
+                                    .map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                });
                 let _ = request.response.send(result);
             }
         });

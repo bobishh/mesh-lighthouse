@@ -114,7 +114,11 @@ fn signed_grant(owner: &Identity, person_id: &str, workspace_id: &str) -> Value 
     .unwrap()
 }
 
-fn signed_state(owner: &Identity, workspace_id: &str) -> MatchLighthouseState {
+fn signed_state_with_preset(
+    owner: &Identity,
+    workspace_id: &str,
+    preset: Option<&str>,
+) -> MatchLighthouseState {
     let mut document = AutoCommit::new();
     document.put(ROOT, "id", workspace_id).unwrap();
     document
@@ -125,6 +129,19 @@ fn signed_state(owner: &Identity, workspace_id: &str) -> MatchLighthouseState {
         .put_object(ROOT, "title", automerge::ObjType::Text)
         .unwrap();
     document.splice_text(&title, 0, 0, workspace_id).unwrap();
+    if let Some(preset) = preset {
+        let entities = document
+            .put_object(ROOT, "entities", automerge::ObjType::Map)
+            .unwrap();
+        let board = document
+            .put_object(&entities, "board", automerge::ObjType::Map)
+            .unwrap();
+        document.put(&board, "kind", "board").unwrap();
+        let preset_object = document
+            .put_object(&board, "preset", automerge::ObjType::Map)
+            .unwrap();
+        document.put(&preset_object, "key", preset).unwrap();
+    }
     let bytes = document.save();
     let hashes = document
         .get_changes(&[])
@@ -172,7 +189,16 @@ fn signed_state(owner: &Identity, workspace_id: &str) -> MatchLighthouseState {
 }
 
 fn fixture(owner: &Identity, keeper: &Identity, workspace_id: &str) -> ScopeFixture {
-    let state = signed_state(owner, workspace_id);
+    fixture_with_preset(owner, keeper, workspace_id, None)
+}
+
+fn fixture_with_preset(
+    owner: &Identity,
+    keeper: &Identity,
+    workspace_id: &str,
+    preset: Option<&str>,
+) -> ScopeFixture {
+    let state = signed_state_with_preset(owner, workspace_id, preset);
     let grant = signed_grant(owner, &keeper.person_id, workspace_id);
     let owner_bundle = owner.bundle(workspace_id);
     let owner_peer = {
@@ -332,6 +358,27 @@ impl Drop for TestKeeper {
 #[path = "keeper_owner_tests.rs"]
 mod owner_tests;
 
+#[test]
+fn intake_follows_the_job_search_preset_across_keeper_scopes() {
+    let keeper = TestKeeper::new();
+    assert!(keeper.host.intake_store().unwrap().is_none());
+    let jobs = fixture_with_preset(
+        &keeper.owner,
+        &keeper.keeper,
+        "jobs-board",
+        Some("job-search"),
+    );
+    keeper
+        .merge_offer(
+            keeper.peer(&keeper.owner, "primary-board"),
+            &keeper.offer(&jobs),
+        )
+        .unwrap();
+    let (workspace_id, store, _) = keeper.host.intake_store().unwrap().unwrap();
+    assert_eq!(workspace_id, "jobs-board");
+    assert!(store.has_board_preset("job-search").unwrap());
+}
+
 #[tokio::test]
 async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_jev_without_invites()
 {
@@ -452,10 +499,7 @@ async fn loco_overview_authenticates_operator_and_reports_existing_boards_and_je
     assert_eq!(overview["keeper"]["deviceId"], keeper.keeper.device_id);
     assert_eq!(overview["replication"]["state"], "idle");
     assert_eq!(overview["replication"]["activePeers"], 0);
-    assert_eq!(
-        overview["triggers"][0]["targetWorkspaceId"],
-        "primary-board"
-    );
+    assert!(overview["triggers"][0]["targetWorkspaceId"].is_null());
     assert_eq!(overview["triggers"][0]["pendingCount"], 1);
     assert!(overview["triggers"][0]["lastResultAt"].as_u64().is_some());
     assert_eq!(

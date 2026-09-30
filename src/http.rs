@@ -825,12 +825,19 @@ pub(crate) async fn admin_overview(
             serde_json::to_value(status).unwrap_or_else(|_| json!({"state":"unknown"}));
     }
     let target_workspace_id = keeper
+        .intake_store()
+        .map_err(|_| PairingResponseError(PairingError::Unavailable))?
+        .map(|(workspace_id, _, _)| workspace_id);
+    let primary_workspace_id = keeper
         .configuration()
         .map_err(|_| PairingResponseError(PairingError::Unavailable))?
         .workspace_id;
+    let visible_workspace_id = target_workspace_id
+        .as_deref()
+        .unwrap_or(&primary_workspace_id);
     let target_is_owned = boards
         .iter()
-        .any(|board| board["workspaceId"] == target_workspace_id);
+        .any(|board| board["workspaceId"].as_str() == Some(visible_workspace_id));
     let state_name = if active_peers > 0 {
         "connected"
     } else if boards

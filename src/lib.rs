@@ -177,6 +177,24 @@ impl MatchScopeStore {
         ))
     }
 
+    pub fn has_board_preset(&self, preset: &str) -> Result<bool, String> {
+        let bytes = self
+            .inner
+            .lock()
+            .map_err(|_| "Lighthouse state lock poisoned")?
+            .state
+            .document
+            .clone();
+        let document =
+            AutoCommit::load(&bytes).map_err(|error| format!("Invalid Match document: {error}"))?;
+        let view =
+            serde_json::to_value(AutoSerde::from(&document)).map_err(|error| error.to_string())?;
+        Ok(view
+            .get("entities")
+            .and_then(Value::as_object)
+            .is_some_and(|entities| board_with_preset(entities, preset).is_some()))
+    }
+
     pub fn authorized_peer_endpoints(&self) -> Result<Vec<String>, String> {
         let mut guard = self
             .inner
@@ -249,13 +267,8 @@ impl MatchScopeStore {
         if entities.contains_key(lead_id) {
             return Ok(lead_id.to_owned());
         }
-        let board = entities
-            .values()
-            .find(|entity| {
-                entity.get("kind").and_then(Value::as_str) == Some("board")
-                    && entity.pointer("/preset/key").and_then(Value::as_str) == Some("job-search")
-            })
-            .ok_or("No job-search board in workspace")?;
+        let board =
+            board_with_preset(entities, "job-search").ok_or("No job-search board in workspace")?;
         let bindings = board
             .pointer("/preset/bindings")
             .and_then(Value::as_object)
@@ -732,7 +745,16 @@ impl NativeScopeHost for MatchScopeStore {
                 .as_ref()
                 .is_some_and(|records| !records.is_empty())
         {
-            return Err("Lighthouse cannot apply mesh authority changes yet".into());
+            return Err(format!(
+                "Lighthouse cannot apply mesh authority changes yet: revocations={} device_revocations={} departures={} ownership_transfers={} succession_policy={} succession_votes={} succession_claims={}",
+                catalog.revocations.len(),
+                catalog.device_revocations.len(),
+                catalog.departures.len(),
+                catalog.ownership_transfers.as_ref().map_or(0, Vec::len),
+                usize::from(catalog.succession_policy.is_some()),
+                catalog.succession_votes.as_ref().map_or(0, Vec::len),
+                catalog.succession_claims.as_ref().map_or(0, Vec::len),
+            ));
         }
         let mut guard = self
             .inner
@@ -842,6 +864,16 @@ fn merge_records(existing: Option<&Vec<Value>>, incoming: &[Value]) -> Vec<Value
         .filter(|record| seen.insert(record.to_string()))
         .cloned()
         .collect()
+}
+
+fn board_with_preset<'a>(
+    entities: &'a serde_json::Map<String, Value>,
+    preset: &str,
+) -> Option<&'a Value> {
+    entities.values().find(|entity| {
+        entity.get("kind").and_then(Value::as_str) == Some("board")
+            && entity.pointer("/preset/key").and_then(Value::as_str) == Some(preset)
+    })
 }
 
 fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {

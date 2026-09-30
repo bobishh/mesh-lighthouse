@@ -189,6 +189,29 @@ impl KeeperHost {
             .collect()
     }
 
+    pub(crate) fn intake_store(&self) -> Result<Option<(String, MatchScopeStore, Value)>, String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "Keeper registry lock poisoned")?;
+        let mut selected = None;
+        for (workspace_id, scope) in &registry.scopes {
+            if !scope.store.has_board_preset("job-search")? {
+                continue;
+            }
+            if selected.is_some() {
+                return Err("Multiple job-search boards in keeper scopes".into());
+            }
+            selected = Some((
+                workspace_id.clone(),
+                scope.store.clone(),
+                scope.local_handshake.peer.clone(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    #[cfg(test)]
     pub(crate) fn primary_store(&self) -> Result<(MatchScopeStore, Value), String> {
         let registry = self
             .registry
@@ -197,7 +220,7 @@ impl KeeperHost {
         let scope = registry
             .scopes
             .get(&registry.config.workspace_id)
-            .ok_or("Missing intake scope")?;
+            .ok_or("Missing primary scope")?;
         Ok((scope.store.clone(), scope.local_handshake.peer.clone()))
     }
 
