@@ -11,10 +11,11 @@ use automerge::{
 };
 use match_authority::{admit_match_candidate, prepare_match_write_authority};
 use meta_mesh_core::{
-    DEFAULT_SIGNATURE_DOMAIN, MeshHandshake, MeshPeerAdmission, VerifyWorkspaceMemberOptions,
-    WorkspaceChangeAuthorizationPayload, WorkspaceWriteAuthorizationSnapshot,
-    authorization_admission_bundle, authorization_records, merge_verified_peer_catalog,
-    sign_json_envelope, validate_mesh_catalog, verify_workspace_member_bundle,
+    DEFAULT_SIGNATURE_DOMAIN, MeshCatalog, MeshHandshake, MeshPeerAdmission, SignedDeparture,
+    SignedDeviceRevocation, VerifyWorkspaceMemberOptions, WorkspaceChangeAuthorizationPayload,
+    WorkspaceWriteAuthorizationSnapshot, authorization_admission_bundle, authorization_records,
+    merge_verified_peer_catalog, sign_json_envelope, validate_mesh_catalog,
+    verify_workspace_member_bundle,
 };
 use meta_mesh_native::{
     FileScopeStore, NativeScopeCredential, NativeScopeHost, NativeScopeServiceHost,
@@ -728,39 +729,12 @@ impl NativeScopeHost for MatchScopeStore {
 
     fn merge_mesh(&mut self, incoming: &Value) -> Result<(), String> {
         let catalog = validate_mesh_catalog(incoming.clone())?;
-        if !catalog.device_revocations.is_empty()
-            || !catalog.departures.is_empty()
-            || !catalog.revocations.is_empty()
-            || catalog
-                .ownership_transfers
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-            || catalog.succession_policy.is_some()
-            || catalog
-                .succession_votes
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-            || catalog
-                .succession_claims
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-        {
-            return Err(format!(
-                "Lighthouse cannot apply mesh authority changes yet: revocations={} device_revocations={} departures={} ownership_transfers={} succession_policy={} succession_votes={} succession_claims={}",
-                catalog.revocations.len(),
-                catalog.device_revocations.len(),
-                catalog.departures.len(),
-                catalog.ownership_transfers.as_ref().map_or(0, Vec::len),
-                usize::from(catalog.succession_policy.is_some()),
-                catalog.succession_votes.as_ref().map_or(0, Vec::len),
-                catalog.succession_claims.as_ref().map_or(0, Vec::len),
-            ));
-        }
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
         let authority = self.authority_cached(&mut guard)?;
+        catalog_authority_is_admitted(&catalog, &authority)?;
         let existing = guard
             .state
             .mesh
@@ -874,6 +848,68 @@ fn board_with_preset<'a>(
         entity.get("kind").and_then(Value::as_str) == Some("board")
             && entity.pointer("/preset/key").and_then(Value::as_str) == Some(preset)
     })
+}
+
+/// Authorization control is admitted before mesh control. Accept redundant
+/// catalog authority only when every signed record is already in that verified
+/// authorization snapshot. An unknown record must wait for its proof frame.
+fn catalog_authority_is_admitted(
+    catalog: &MeshCatalog,
+    authority: &WorkspaceWriteAuthorizationSnapshot,
+) -> Result<(), String> {
+    let known =
+        |incoming: &[Value], saved: &[Value]| incoming.iter().all(|record| saved.contains(record));
+    let revocations = authority
+        .revocations
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let transfers = authority
+        .ownership_transfers
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let claims = authority
+        .succession_claims
+        .iter()
+        .map(|record| serde_json::to_value(record).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let devices_known = catalog.device_revocations.iter().all(|raw| {
+        serde_json::from_value::<SignedDeviceRevocation>(raw.clone()).is_ok_and(|incoming| {
+            authority
+                .device_revocations
+                .iter()
+                .any(|saved| saved.record == incoming.record)
+        })
+    });
+    let departures_known = catalog.departures.iter().all(|raw| {
+        serde_json::from_value::<SignedDeparture>(raw.clone()).is_ok_and(|incoming| {
+            authority
+                .departures
+                .iter()
+                .any(|saved| saved.record == incoming.record)
+        })
+    });
+    if !known(&catalog.revocations, &revocations)
+        || !known(
+            catalog.ownership_transfers.as_deref().unwrap_or_default(),
+            &transfers,
+        )
+        || !known(
+            catalog.succession_claims.as_deref().unwrap_or_default(),
+            &claims,
+        )
+        || !devices_known
+        || !departures_known
+        || catalog.succession_policy.is_some()
+        || catalog
+            .succession_votes
+            .as_ref()
+            .is_some_and(|votes| !votes.is_empty())
+    {
+        return Err("Mesh authority has not been admitted by signed authorization".into());
+    }
+    Ok(())
 }
 
 fn merge_chat(current: &Value, incoming: &Value) -> Result<Value, String> {
@@ -1176,6 +1212,48 @@ mod tests {
                 .merge_mesh(&json!({"version":1,"peers":[],"revocations":[{}]}))
                 .is_err()
         );
+        let revoked_at = time::OffsetDateTime::now_utc()
+            .format(
+                &time::format_description::parse_borrowed::<2>(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let heads = vec![document.get_heads()[0].to_string()];
+        let revocation = sign_json_envelope(
+            &[2; 32],
+            json!({"kind":"workspace-revocation","version":1,"workspaceId":"board",
+                "ownerPersonId":person_id,"personId":"former-member","epoch":2,
+                "workspaceHeads":heads,"revokedAt":revoked_at}),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let device_revocation = sign_json_envelope(
+            &[2; 32],
+            json!({"kind":"workspace-device-revocation","version":1,"workspaceId":"board",
+                "personId":"former-member","deviceId":"old-device",
+                "workspaceHeads":heads,"revokedAt":revoked_at}),
+            &device_id,
+            DEFAULT_SIGNATURE_DOMAIN,
+        )
+        .unwrap();
+        let mut updated_authority = evidence.clone();
+        updated_authority["revocations"] = json!([revocation]);
+        updated_authority["deviceRevocations"] = json!([{
+            "record": device_revocation, "signer": evidence["genesisOwner"]
+        }]);
+        store
+            .merge_authorization(&json!({"version":1,"records":[],"authority":updated_authority}))
+            .unwrap();
+        let admitted_catalog = json!({"version":1,"peers":[],"revocations":[revocation],
+            "deviceRevocations":[{"record":device_revocation,
+                "authority":evidence["genesisOwner"]}]});
+        store.merge_mesh(&admitted_catalog).unwrap();
+        let mut unseen = admitted_catalog;
+        unseen["revocations"][0]["signature"] = json!("unknown-signature");
+        assert!(store.merge_mesh(&unseen).is_err());
         let mut reopened =
             MatchScopeStore::open("board".into(), person_id, path.clone(), initial).unwrap();
         assert_eq!(reopened.snapshot().unwrap().document, candidate);
