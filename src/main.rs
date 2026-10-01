@@ -258,14 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let route_sequence = previous.saturating_add(1).max(now_ms()?.try_into()?);
     route_store.write_validated(route_sequence.to_string().as_bytes(), None, |_, _| Ok(()))?;
     host.refresh_routes(route_sequence)?;
-    let result = replication::run(
-        Arc::clone(&node),
-        service,
-        host,
-        runtime_overview,
-        shutdown_receiver,
-    )
-    .await;
+    let result =
+        replication::run(Arc::clone(&node), host, runtime_overview, shutdown_receiver).await;
     incoming.abort();
     let _ = incoming.await;
     // Worker cancellation finishes synchronous atomic store writes before releasing the node.

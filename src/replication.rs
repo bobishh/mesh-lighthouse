@@ -18,6 +18,18 @@ use crate::keeper::KeeperHost;
 type Service = Arc<Mutex<NativeScopeService<KeeperHost>>>;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+fn scope_service<T>(
+    services: &mut HashMap<String, Arc<Mutex<T>>>,
+    workspace: &str,
+    create: impl FnOnce() -> T,
+) -> Arc<Mutex<T>> {
+    Arc::clone(
+        services
+            .entry(workspace.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(create()))),
+    )
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeOverview(Arc<StdMutex<HashMap<(String, String), ScopeRuntimeStatus>>>);
 
@@ -111,12 +123,12 @@ fn frame_label(frame: &str) -> &'static str {
 /// lock or postpone replication of another board.
 pub(crate) async fn run(
     node: Arc<NativeNode>,
-    service: Service,
     host: KeeperHost,
     overview: RuntimeOverview,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut workers = HashMap::<(String, String), tokio::task::JoinHandle<()>>::new();
+    let mut services = HashMap::<String, Service>::new();
     let mut authorized = HashSet::<String>::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -172,9 +184,12 @@ pub(crate) async fn run(
                     worker.abort();
                     let _ = worker.await;
                 }
-                service.lock().await.forget_peer(&workspace, &route);
+                if let Some(service) = services.get(&workspace) {
+                    service.lock().await.forget_peer(&workspace, &route);
+                }
                 overview.forget(&workspace, &route);
             }
+            services.retain(|workspace, _| targets.keys().any(|(id, _)| id == workspace));
             for ((workspace, route), secret) in targets {
                 let key = (workspace.clone(), route.clone());
                 if workers
@@ -184,7 +199,11 @@ pub(crate) async fn run(
                     continue;
                 }
                 let peer_node = Arc::clone(&node);
-                let peer_service = Arc::clone(&service);
+                // Share sessions within one board, never its heavy document lock
+                // with another board. KeeperHost still owns durable scope stores.
+                let peer_service = scope_service(&mut services, &workspace, || {
+                    NativeScopeService::new(host.clone())
+                });
                 let host_for_worker = host.clone();
                 let overview_for_worker = overview.clone();
                 overview.update(&workspace, &route, |status| {
@@ -257,7 +276,8 @@ async fn serve_frames(
         let mut guard = service.lock().await;
         let waited = service_started.elapsed();
         let receive_started = std::time::Instant::now();
-        let response = guard.receive(&route, request.payload(), now_ms()?);
+        let response =
+            tokio::task::block_in_place(|| guard.receive(&route, request.payload(), now_ms()?));
         let receive_elapsed = receive_started.elapsed();
         drop(guard);
         match response {
@@ -536,6 +556,22 @@ impl Drop for PeerLifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn busy_board_does_not_delay_another_boards_heartbeat_but_serializes_its_own_peers() {
+        let mut services = HashMap::new();
+        let busy = scope_service(&mut services, "jobsearch", || 0);
+        let same_board = scope_service(&mut services, "jobsearch", || 1);
+        let other_board = scope_service(&mut services, "other", || 2);
+        let writing = busy.lock().await;
+        assert!(same_board.try_lock().is_err());
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), other_board.lock())
+            .await
+            .expect("unrelated heartbeat must not wait for Jobsearch persistence");
+        assert_eq!(*heartbeat, 2);
+        drop(writing);
+        assert!(same_board.try_lock().is_ok());
+    }
 
     #[test]
     fn healthy_route_survives_other_route_failure_and_removed_workers_disappear() {
