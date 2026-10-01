@@ -19,9 +19,9 @@ loco-rs = { version = "=1.2.0", default-features = false }
 base64 = "0.22"
 hmac = "0.12"
 jev-sdk = "=0.1.0"
-match-authority = { git = "https://github.com/bobishh/match.git", rev = "08e9caafcdd4557da3d69a94f38bb3a28ec1340a" }
-meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "de5432eacb865a1d2fc3237620e3e0fabc09005d" }
-meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "de5432eacb865a1d2fc3237620e3e0fabc09005d" }
+match-authority = { git = "https://github.com/bobishh/match.git", rev = "0f13c57ef36177a6edad7dd16e908ee43fe0a282" }
+meta-mesh-core = { git = "https://github.com/bobishh/meta-mesh.git", rev = "03f51ccdefb491d0a1bd725197d027ccbb89a1d1" }
+meta-mesh-native = { git = "https://github.com/bobishh/meta-mesh.git", rev = "03f51ccdefb491d0a1bd725197d027ccbb89a1d1" }
 automerge = "0.12"
 iroh = "1.2.0"
 rand = "0.10"

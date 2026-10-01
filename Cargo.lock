@@ -3227,7 +3227,7 @@ dependencies = [
 [[package]]
 name = "match-authority"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/match.git?rev=08e9caafcdd4557da3d69a94f38bb3a28ec1340a#08e9caafcdd4557da3d69a94f38bb3a28ec1340a"
+source = "git+https://github.com/bobishh/match.git?rev=0f13c57ef36177a6edad7dd16e908ee43fe0a282#0f13c57ef36177a6edad7dd16e908ee43fe0a282"
 dependencies = [
  "automerge",
  "meta-mesh-core",
@@ -3305,7 +3305,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-core"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5432eacb865a1d2fc3237620e3e0fabc09005d#de5432eacb865a1d2fc3237620e3e0fabc09005d"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=03f51ccdefb491d0a1bd725197d027ccbb89a1d1#03f51ccdefb491d0a1bd725197d027ccbb89a1d1"
 dependencies = [
  "aes-gcm",
  "automerge",
@@ -3325,7 +3325,7 @@ dependencies = [
 [[package]]
 name = "meta-mesh-native"
 version = "0.1.0"
-source = "git+https://github.com/bobishh/meta-mesh.git?rev=de5432eacb865a1d2fc3237620e3e0fabc09005d#de5432eacb865a1d2fc3237620e3e0fabc09005d"
+source = "git+https://github.com/bobishh/meta-mesh.git?rev=03f51ccdefb491d0a1bd725197d027ccbb89a1d1#03f51ccdefb491d0a1bd725197d027ccbb89a1d1"
 dependencies = [
  "blake3",
  "bytes",
