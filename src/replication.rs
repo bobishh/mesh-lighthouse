@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -17,18 +17,77 @@ use tokio::sync::Mutex;
 
 use crate::keeper::KeeperHost;
 
-type Service = Arc<Mutex<NativeScopeService<KeeperHost>>>;
+type Service = Arc<ScopeService>;
+struct ScopeService {
+    inner: Mutex<NativeScopeService<KeeperHost>>,
+    receive_gate: ReceiveGate,
+}
+impl ScopeService {
+    fn new(host: KeeperHost) -> Self {
+        Self {
+            inner: Mutex::new(NativeScopeService::new(host)),
+            receive_gate: ReceiveGate::default(),
+        }
+    }
+}
+impl std::ops::Deref for ScopeService {
+    type Target = Mutex<NativeScopeService<KeeperHost>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[derive(Default)]
+struct ReceiveGate {
+    active: Mutex<()>,
+    heartbeats: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+struct WaitingHeartbeat<'a>(&'a ReceiveGate);
+impl Drop for WaitingHeartbeat<'_> {
+    fn drop(&mut self) {
+        self.0.heartbeats.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+impl ReceiveGate {
+    async fn acquire(&self, heartbeat: bool) -> tokio::sync::MutexGuard<'_, ()> {
+        if heartbeat {
+            self.heartbeats.fetch_add(1, Ordering::SeqCst);
+            let pending = WaitingHeartbeat(self);
+            let guard = self.active.lock().await;
+            drop(pending);
+            return guard;
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.heartbeats.load(Ordering::SeqCst) > 0 {
+                changed.await;
+                continue;
+            }
+            let guard = self.active.lock().await;
+            if self.heartbeats.load(Ordering::SeqCst) == 0 {
+                return guard;
+            }
+            // Yield queued bulk work to an already waiting heartbeat. The
+            // current durable receive is never preempted or acknowledged early.
+            drop(guard);
+        }
+    }
+}
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn scope_service<T>(
-    services: &mut HashMap<String, Arc<Mutex<T>>>,
+    services: &mut HashMap<String, Arc<T>>,
     workspace: &str,
     create: impl FnOnce() -> T,
-) -> Arc<Mutex<T>> {
+) -> Arc<T> {
     Arc::clone(
         services
             .entry(workspace.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(create()))),
+            .or_insert_with(|| Arc::new(create())),
     )
 }
 
@@ -204,7 +263,7 @@ pub(crate) async fn run(
                 // Share sessions within one board, never its heavy document lock
                 // with another board. KeeperHost still owns durable scope stores.
                 let peer_service = scope_service(&mut services, &workspace, || {
-                    NativeScopeService::new(host.clone())
+                    ScopeService::new(host.clone())
                 });
                 let host_for_worker = host.clone();
                 let overview_for_worker = overview.clone();
@@ -333,6 +392,7 @@ async fn process_frame(
         );
     }
     let service_started = std::time::Instant::now();
+    let receive_turn = service.receive_gate.acquire(kind == "sync-heartbeat").await;
     let mut guard = service.lock().await;
     let waited = service_started.elapsed();
     let receive_started = std::time::Instant::now();
@@ -340,6 +400,7 @@ async fn process_frame(
         tokio::task::block_in_place(|| guard.receive(&route, request.payload(), now_ms()?));
     let receive_elapsed = receive_started.elapsed();
     drop(guard);
+    drop(receive_turn);
     match response {
         Ok(response) => {
             let send_started = std::time::Instant::now();
@@ -620,9 +681,9 @@ mod tests {
     #[tokio::test]
     async fn busy_board_does_not_delay_another_boards_heartbeat_but_serializes_its_own_peers() {
         let mut services = HashMap::new();
-        let busy = scope_service(&mut services, "jobsearch", || 0);
-        let same_board = scope_service(&mut services, "jobsearch", || 1);
-        let other_board = scope_service(&mut services, "other", || 2);
+        let busy = scope_service(&mut services, "jobsearch", || Mutex::new(0));
+        let same_board = scope_service(&mut services, "jobsearch", || Mutex::new(1));
+        let other_board = scope_service(&mut services, "other", || Mutex::new(2));
         let writing = busy.lock().await;
         assert!(same_board.try_lock().is_err());
         let heartbeat = tokio::time::timeout(Duration::from_millis(100), other_board.lock())
@@ -683,6 +744,47 @@ mod tests {
         release_document.notify_one();
         drop(send);
         assert_eq!(receiver.await.unwrap(), Err("closed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_precedes_queued_bulk_and_cancellation_releases_priority() {
+        let gate = Arc::new(ReceiveGate::default());
+        let current_write = gate.acquire(false).await;
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let bulk_gate = Arc::clone(&gate);
+        let bulk_order = Arc::clone(&order);
+        let bulk = tokio::spawn(async move {
+            let _turn = bulk_gate.acquire(false).await;
+            bulk_order.lock().unwrap().push("bulk");
+        });
+        tokio::task::yield_now().await;
+        let heartbeat_gate = Arc::clone(&gate);
+        let heartbeat_order = Arc::clone(&order);
+        let heartbeat = tokio::spawn(async move {
+            let _turn = heartbeat_gate.acquire(true).await;
+            heartbeat_order.lock().unwrap().push("heartbeat");
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(gate.heartbeats.load(Ordering::SeqCst), 1);
+        drop(current_write);
+        heartbeat.await.unwrap();
+        bulk.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["heartbeat", "bulk"]);
+
+        let write = gate.acquire(false).await;
+        let waiting_gate = Arc::clone(&gate);
+        let waiting = tokio::spawn(async move {
+            let _turn = waiting_gate.acquire(true).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(gate.heartbeats.load(Ordering::SeqCst), 1);
+        waiting.abort();
+        let _ = waiting.await;
+        drop(write);
+        assert_eq!(gate.heartbeats.load(Ordering::SeqCst), 0);
+        let _turn = tokio::time::timeout(Duration::from_millis(100), gate.acquire(false))
+            .await
+            .expect("cancelled heartbeat must not strand bulk sync");
     }
 
     #[test]
