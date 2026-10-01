@@ -688,6 +688,22 @@ impl NativeScopeHost for MatchScopeStore {
             .map_err(|_| "Lighthouse state lock poisoned")?;
         let incoming_evidence = incoming.get("authority").ok_or("Missing Match authority")?;
         let incoming_records = authorization_records(incoming)?;
+        // Already admitted evidence adds no grant, revocation, or document change.
+        // Any unknown record or changed authority still takes full admission.
+        if guard.state.authorization.get("authority") == Some(incoming_evidence) {
+            let known = guard.state.authorization["records"]
+                .as_array()
+                .ok_or("Invalid stored Match authorizations")?
+                .iter()
+                .map(Value::to_string)
+                .collect::<BTreeSet<_>>();
+            if incoming_records
+                .iter()
+                .all(|record| known.contains(&record.to_string()))
+            {
+                return Ok(());
+            }
+        }
         let (snapshot, merged) = prepare_match_write_authority(
             &guard.state.document,
             incoming_evidence,
@@ -1103,6 +1119,22 @@ mod tests {
                 .get("records")
                 .is_some(),
             "paged enrollment normalizes to internal aggregate storage"
+        );
+        let repeated = store.snapshot().unwrap().authorization.unwrap();
+        let storage_before_repeat = std::fs::metadata(&path).unwrap().modified().unwrap();
+        store.merge_authorization(&repeated).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            storage_before_repeat,
+            "trusted repeat must not rewrite storage or reload document history"
+        );
+        let mut forged = repeated.clone();
+        forged["records"][0]["signed"]["signature"] = json!("forged-repeat");
+        let _ = store.merge_authorization(&forged);
+        assert_eq!(
+            store.snapshot().unwrap().authorization.unwrap(),
+            repeated,
+            "unknown signature must never enter accepted authorization storage"
         );
         document.put(ROOT, "title", "Updated").unwrap();
         let candidate = document.save();
