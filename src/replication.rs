@@ -10,7 +10,9 @@ use std::{
 
 use iroh::{EndpointAddr, EndpointId};
 use match_lighthouse::now_ms;
-use meta_mesh_native::{NativeBrowserConnection, NativeNode, NativeScopeService, publish_scope_to};
+use meta_mesh_native::{
+    NativeBrowserConnection, NativeBrowserRequest, NativeNode, NativeScopeService, publish_scope_to,
+};
 use tokio::sync::Mutex;
 
 use crate::keeper::KeeperHost;
@@ -246,77 +248,135 @@ async fn serve_frames(
     connection_id: String,
     trace: bool,
 ) -> Result<(), String> {
-    loop {
-        let request = match connection.accept().await {
-            Ok(request) => request,
-            Err(error) => {
-                if trace {
-                    eprintln!(
-                        "trace.sync event=stream.accept.failed connection={connection_id} workspace={} route={} cause=peer_or_transport_closed",
-                        prefix(&workspace),
-                        prefix(&route)
-                    );
+    drive_frames(
+        || async {
+            match connection.accept().await {
+                Ok(request) => Ok(request),
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "trace.sync event=stream.accept.failed connection={connection_id} workspace={} route={} cause=peer_or_transport_closed",
+                            prefix(&workspace),
+                            prefix(&route)
+                        );
+                    }
+                    Err(error.to_string())
                 }
-                return Err(error.to_string());
+            }
+        },
+        |request| {
+            process_frame(
+                request,
+                Arc::clone(&service),
+                route.clone(),
+                workspace.clone(),
+                connection_id.clone(),
+                trace,
+            )
+        },
+    )
+    .await
+}
+
+// Preserve one in-progress accept/read future while completions arrive: dropping
+// it after accept_bi could discard a partially read stream. Bound concurrency;
+// service locking still serializes signed admission and durable storage.
+async fn drive_frames<T, A, AF, H, HF>(mut accept: A, handle: H) -> Result<(), String>
+where
+    T: Send + 'static,
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = Result<T, String>>,
+    H: Fn(T) -> HF,
+    HF: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut frames = tokio::task::JoinSet::new();
+    loop {
+        if frames.len() >= 16 {
+            frames
+                .join_next()
+                .await
+                .expect("bounded set is nonempty")
+                .map_err(|error| error.to_string())??;
+        }
+        let next = accept();
+        tokio::pin!(next);
+        let request = loop {
+            tokio::select! {
+                request = &mut next => break request?,
+                result = frames.join_next(), if !frames.is_empty() => {
+                    result.expect("nonempty frame set").map_err(|error| error.to_string())??;
+                }
             }
         };
-        let kind = meta_mesh_core::PairingCodec::inspect(request.payload())
-            .map(|header| header.frame_type)
-            .unwrap_or_else(|_| "invalid".into());
-        let kind = frame_label(&kind);
-        let started = std::time::Instant::now();
-        if trace {
-            eprintln!(
-                "trace.sync event=frame.start connection={connection_id} workspace={} route={} frame={kind}",
-                prefix(&workspace),
-                prefix(&route)
-            );
+        frames.spawn(handle(request));
+    }
+}
+
+async fn process_frame(
+    request: NativeBrowserRequest,
+    service: Service,
+    route: String,
+    workspace: String,
+    connection_id: String,
+    trace: bool,
+) -> Result<(), String> {
+    let kind = meta_mesh_core::PairingCodec::inspect(request.payload())
+        .map(|header| header.frame_type)
+        .unwrap_or_else(|_| "invalid".into());
+    let kind = frame_label(&kind);
+    let started = std::time::Instant::now();
+    if trace {
+        eprintln!(
+            "trace.sync event=frame.start connection={connection_id} workspace={} route={} frame={kind}",
+            prefix(&workspace),
+            prefix(&route)
+        );
+    }
+    let service_started = std::time::Instant::now();
+    let mut guard = service.lock().await;
+    let waited = service_started.elapsed();
+    let receive_started = std::time::Instant::now();
+    let response =
+        tokio::task::block_in_place(|| guard.receive(&route, request.payload(), now_ms()?));
+    let receive_elapsed = receive_started.elapsed();
+    drop(guard);
+    match response {
+        Ok(response) => {
+            let send_started = std::time::Instant::now();
+            let result = request
+                .respond(response.as_deref().unwrap_or_default())
+                .await;
+            if trace {
+                eprintln!(
+                    "trace.sync event=frame.done connection={connection_id} workspace={} route={} frame={kind} result={} lock_ms={} receive_ms={} respond_ms={} total_ms={}",
+                    prefix(&workspace),
+                    prefix(&route),
+                    if result.is_ok() { "ok" } else { "error" },
+                    waited.as_millis(),
+                    receive_elapsed.as_millis(),
+                    send_started.elapsed().as_millis(),
+                    started.elapsed().as_millis()
+                );
+            }
+            result.map_err(|error| error.to_string())?;
         }
-        let service_started = std::time::Instant::now();
-        let mut guard = service.lock().await;
-        let waited = service_started.elapsed();
-        let receive_started = std::time::Instant::now();
-        let response =
-            tokio::task::block_in_place(|| guard.receive(&route, request.payload(), now_ms()?));
-        let receive_elapsed = receive_started.elapsed();
-        drop(guard);
-        match response {
-            Ok(response) => {
-                let send_started = std::time::Instant::now();
-                let result = request
-                    .respond(response.as_deref().unwrap_or_default())
-                    .await;
-                if trace {
-                    eprintln!(
-                        "trace.sync event=frame.done connection={connection_id} workspace={} route={} frame={kind} result={} lock_ms={} receive_ms={} respond_ms={} total_ms={}",
-                        prefix(&workspace),
-                        prefix(&route),
-                        if result.is_ok() { "ok" } else { "error" },
-                        waited.as_millis(),
-                        receive_elapsed.as_millis(),
-                        send_started.elapsed().as_millis(),
-                        started.elapsed().as_millis()
-                    );
-                }
-                result.map_err(|error| error.to_string())?;
+        Err(error) => {
+            // Invalid or unpersisted data receives no success receipt. Drop
+            // this stream while preserving unrelated valid streams.
+            if trace {
+                eprintln!(
+                    "trace.sync event=frame.done connection={connection_id} workspace={} route={} frame={kind} result=rejected lock_ms={} receive_ms={} total_ms={}",
+                    prefix(&workspace),
+                    prefix(&route),
+                    waited.as_millis(),
+                    receive_elapsed.as_millis(),
+                    started.elapsed().as_millis()
+                );
             }
-            Err(error) => {
-                // Invalid or unpersisted data receives no success receipt. Drop
-                // this stream while preserving unrelated valid streams.
-                if trace {
-                    eprintln!(
-                        "trace.sync event=frame.done connection={connection_id} workspace={} route={} frame={kind} result=rejected lock_ms={} receive_ms={} total_ms={}",
-                        prefix(&workspace),
-                        prefix(&route),
-                        waited.as_millis(),
-                        receive_elapsed.as_millis(),
-                        started.elapsed().as_millis()
-                    );
-                }
-                eprintln!("Lighthouse rejected scope frame: {error}");
-            }
+            eprintln!("Lighthouse rejected scope frame: {error}");
         }
     }
+    Ok(())
 }
 
 async fn replicate(
@@ -571,6 +631,58 @@ mod tests {
         assert_eq!(*heartbeat, 2);
         drop(writing);
         assert!(same_board.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_document_stream_does_not_stop_accepting_heartbeat_streams() {
+        let (send, receive) = tokio::sync::mpsc::channel(4);
+        let document_started = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_started = Arc::new(tokio::sync::Notify::new());
+        let release_document = Arc::new(tokio::sync::Notify::new());
+        let document = Arc::clone(&document_started);
+        let heartbeat = Arc::clone(&heartbeat_started);
+        let release = Arc::clone(&release_document);
+        let receiver = tokio::spawn(async move {
+            // Model accept as an owned receive future so it can remain pinned.
+            let channel = Arc::new(Mutex::new(receive));
+            drive_frames(
+                || {
+                    let channel = Arc::clone(&channel);
+                    async move {
+                        channel
+                            .lock()
+                            .await
+                            .recv()
+                            .await
+                            .ok_or("closed".to_string())
+                    }
+                },
+                |is_document| {
+                    let document = Arc::clone(&document);
+                    let heartbeat = Arc::clone(&heartbeat);
+                    let release = Arc::clone(&release);
+                    async move {
+                        if is_document {
+                            document.notify_one();
+                            release.notified().await;
+                        } else {
+                            heartbeat.notify_one();
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        });
+        send.send(true).await.unwrap();
+        document_started.notified().await;
+        send.send(false).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), heartbeat_started.notified())
+            .await
+            .expect("heartbeat must reach admission while document processing is pending");
+        release_document.notify_one();
+        drop(send);
+        assert_eq!(receiver.await.unwrap(), Err("closed".to_string()));
     }
 
     #[test]
