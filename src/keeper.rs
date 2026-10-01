@@ -154,10 +154,15 @@ impl KeeperHost {
             {
                 return Err("Keeper scope secrets must be distinct".into());
             }
-            if scopes
-                .insert(scope.workspace_id.clone(), scope_host(scope)?)
-                .is_some()
-            {
+            let started = std::time::Instant::now();
+            eprintln!("Lighthouse restoring scope {}", scope.workspace_id);
+            let host = scope_host(scope)?;
+            eprintln!(
+                "Lighthouse restored scope {} in {}ms",
+                scope.workspace_id,
+                started.elapsed().as_millis()
+            );
+            if scopes.insert(scope.workspace_id.clone(), host).is_some() {
                 return Err("Duplicate keeper scope".into());
             }
         }

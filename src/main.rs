@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .try_into()
         .map_err(|_| "Lighthouse Iroh secret must contain 32 bytes")?;
     let owner_id = EndpointId::from_str(&config.owner_endpoint_id)?;
+    let host = keeper::KeeperHost::open(config.clone(), fs::canonicalize(&path)?)?;
     let node = Arc::new(
         NativeNode::start_with_options(NativeNodeOptions {
             secret: Some(secret),
@@ -148,7 +149,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .await?,
     );
-    let host = keeper::KeeperHost::open(config.clone(), fs::canonicalize(&path)?)?;
     let discovery = discovery.map(|discovery| {
         discovery.with_provisioner(provisioning::ProvisioningService::new(
             host.clone(),
