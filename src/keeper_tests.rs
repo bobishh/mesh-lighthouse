@@ -1020,3 +1020,75 @@ async fn config_mode_sigterm_drains_http_and_exits_without_losing_durable_state(
     host.open_scope(&peer)
         .expect("signed durable snapshot remains admissible after SIGTERM");
 }
+
+#[tokio::test]
+async fn browser_diagnostics_reject_foreign_origins_private_fields_and_empty_sessions() {
+    let keeper = TestKeeper::new();
+    fs::write(
+        keeper.directory.join("cors-origins.json"),
+        json!({"version":1,"origins":["https://match.example"]}).to_string(),
+    )
+    .unwrap();
+    let config = keeper.host.configuration().unwrap();
+    let discovery =
+        crate::http::Discovery::from_peer(&config.local_handshake.peer, "http://127.0.0.1")
+            .unwrap();
+    let app =
+        crate::http::operator_test_router(&keeper.directory, discovery, keeper.host.clone()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/telemetry", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let valid = json!({"sessionId":"session-1","events":[{
+        "timestamp_ms": match_lighthouse::now_ms().unwrap(), "event":"chat.rendered", "record_id":"device-1:message-1"
+    }]});
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Origin", "https://foreign.example")
+            .json(&valid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let mut private = valid.clone();
+    private["events"][0]["body"] = json!("private chat");
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Origin", "https://match.example")
+            .json(&private)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+    let mut empty = valid.clone();
+    empty["sessionId"] = json!("");
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Origin", "https://match.example")
+            .json(&empty)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Origin", "https://match.example")
+            .json(&valid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    server.abort();
+}

@@ -63,6 +63,7 @@ pub(crate) struct ProvisioningCommit {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match_lighthouse::telemetry::start();
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or(
         "Usage: match-lighthouse CONFIG.json | match-lighthouse join INVITE_URL STATE_DIR",

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod proof_cache;
+pub mod telemetry;
 use proof_cache::ProofPageCache;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -678,7 +679,17 @@ impl NativeScopeHost for MatchScopeStore {
         let mut next = guard.state.clone();
         next.document = candidate.to_vec();
         next.authorization = json!({"version": 1, "records": records, "authority": merged});
-        self.save(&mut guard, next)
+        self.save(&mut guard, next)?;
+        for hash in accepted_hashes {
+            telemetry::emit(telemetry::Event::new(
+                "document.persisted",
+                &self.workspace_id,
+                hash,
+                "persist",
+                0,
+            ));
+        }
+        Ok(())
     }
 
     fn merge_authorization(&mut self, incoming: &Value) -> Result<(), String> {
@@ -738,9 +749,41 @@ impl NativeScopeHost for MatchScopeStore {
             .inner
             .lock()
             .map_err(|_| "Lighthouse state lock poisoned")?;
+        let previous_ids = guard.state.chat["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.pointer("/signed/payload/id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let mut next = guard.state.clone();
         next.chat = merge_chat(&next.chat, incoming)?;
-        self.save(&mut guard, next)
+        if next.chat == guard.state.chat {
+            return Ok(());
+        }
+        let added = next.chat["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                let id = value.pointer("/signed/payload/id")?.as_str()?;
+                if previous_ids.contains(id) {
+                    return None;
+                }
+                Some(id.to_owned())
+            })
+            .collect::<Vec<_>>();
+        self.save(&mut guard, next)?;
+        for id in added {
+            telemetry::emit(telemetry::Event::new(
+                "chat.persisted",
+                &self.workspace_id,
+                &id,
+                "persist",
+                0,
+            ));
+        }
+        Ok(())
     }
 
     fn merge_mesh(&mut self, incoming: &Value) -> Result<(), String> {

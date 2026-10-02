@@ -17,6 +17,27 @@ use tokio::sync::Mutex;
 
 use crate::keeper::KeeperHost;
 
+fn publish_diagnostic(
+    workspace: &str,
+    route: &str,
+    connection: &str,
+    phase: &str,
+    duration: Duration,
+    outcome: &str,
+) {
+    let mut event = match_lighthouse::telemetry::Event::new(
+        "publish.finished",
+        workspace,
+        "",
+        phase,
+        duration.as_millis() as u64,
+    );
+    event.peer_id = route.into();
+    event.connection_id = connection.into();
+    event.outcome = outcome.into();
+    match_lighthouse::telemetry::emit(event);
+}
+
 type Service = Arc<ScopeService>;
 struct ScopeService {
     inner: Mutex<NativeScopeService<KeeperHost>>,
@@ -401,6 +422,23 @@ async fn process_frame(
     let receive_elapsed = receive_started.elapsed();
     drop(guard);
     drop(receive_turn);
+    let mut diagnostic = match_lighthouse::telemetry::Event::new(
+        "frame.received",
+        &workspace,
+        "",
+        kind,
+        started.elapsed().as_millis() as u64,
+    );
+    diagnostic.connection_id = connection_id.to_string();
+    diagnostic.peer_id = route.to_string();
+    diagnostic.outcome = if response.is_ok() { "ok" } else { "rejected" }.into();
+    match_lighthouse::telemetry::emit(diagnostic.clone());
+    diagnostic.event = "frame.lock".into();
+    diagnostic.duration_ms = waited.as_millis() as u64;
+    match_lighthouse::telemetry::emit(diagnostic.clone());
+    diagnostic.event = "frame.admitted".into();
+    diagnostic.duration_ms = receive_elapsed.as_millis() as u64;
+    match_lighthouse::telemetry::emit(diagnostic);
     match response {
         Ok(response) => {
             let send_started = std::time::Instant::now();
@@ -568,6 +606,8 @@ async fn replicate(
                             eprintln!("trace.sync event=publish.start connection={connection_id} workspace={} route={}", prefix(&workspace), prefix(&route));
                         }
                         if let Err(error) = publish_scope_to(&connection, &service, &workspace, &route, now_ms()?, Duration::from_secs(12)).await {
+                            publish_diagnostic(&workspace, &route, &connection_id, error.stage,
+                                publish_started.elapsed(), if error.is_exchange_timeout() { "timeout" } else { "error" });
                             if error.is_exchange_timeout() {
                                 overview.update(&workspace, &route, |status| {
                                     status.last_error_category = Some("publish_timeout".into());
@@ -594,6 +634,7 @@ async fn replicate(
                             }
                             break Err(error.to_string());
                         }
+                        publish_diagnostic(&workspace, &route, &connection_id, "complete", publish_started.elapsed(), "ok");
                         publish_failures = 0;
                         overview.update(&workspace, &route, |status| {
                             status.last_success_at = match_lighthouse::now_ms().ok()
